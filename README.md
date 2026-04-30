@@ -1,4 +1,3 @@
-cat > README.md << 'EOF'
 # NBA Encyclopedia
 
 A Streamlit-powered NBA analytics app with live stats, player/team cards, standings, comparisons, and an AI analyst agent.
