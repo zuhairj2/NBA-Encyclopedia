@@ -1,0 +1,6 @@
+nba_api
+pandas
+groq
+streamlit
+langchain
+dotenv
