@@ -16,6 +16,14 @@ from agent.tools import (
     get_player_accolades,
     get_team_game_log,
     get_full_standings,
+    get_team_schedule,
+    search_game_boxscore,
+    get_player_playoff_stats,
+    get_player_stats_vs_team,
+    get_games_on_date,
+    get_boxscore_by_game_id,
+    detect_season_type,
+    get_todays_games,
 )
 from utils.parser import extract_single_player, extract_team, extract_teams, TEAM_MAP
 
@@ -54,9 +62,114 @@ def pct(val):
 
 
 def zone_chart_svg(zones=None):
-    def fmt(val):
+    """
+    Render a clean half-court shot chart with colored zones.
+    Green = hot, yellow = average, orange/red = cold, dark = no data.
+    """
+    z = zones or {}
+
+    def color_for(pct):
+        if pct is None:
+            return "#1e293b", "#334155", "#64748b"
+        if pct >= 55:
+            return "#14532d", "#22c55e", "#86efac"
+        if pct >= 45:
+            return "#166534", "#4ade80", "#d1fae5"
+        if pct >= 38:
+            return "#713f12", "#eab308", "#fef9c3"
+        if pct >= 30:
+            return "#7c2d12", "#f97316", "#fed7aa"
+        return "#7f1d1d", "#ef4444", "#fee2e2"
+
+    def get_zone(key):
+        val = z.get(key)
+        return val, color_for(val)
+
+    def lbl(val):
         return f"{val}%" if val is not None else "—"
 
+    def box(x, y, w, h, val, colors, title, rx=6):
+        bg, bdr, txt = colors
+        return (
+            f'<rect x="{x}" y="{y}" width="{w}" height="{h}" rx="{rx}" '
+            f'fill="{bg}" stroke="{bdr}" stroke-width="1.5"/>' +
+            (f'<text x="{x+w//2}" y="{y+h//2-9}" text-anchor="middle" font-size="10" '
+             f'fill="{txt}" font-family="system-ui,sans-serif">{title}</text>'
+             f'<text x="{x+w//2}" y="{y+h//2+10}" text-anchor="middle" font-size="17" '
+             f'font-weight="700" fill="{txt}" font-family="system-ui,sans-serif">{lbl(val)}</text>'
+             if title else
+             f'<text x="{x+w//2}" y="{y+h//2+5}" text-anchor="middle" font-size="10" '
+             f'fill="{txt}" font-family="system-ui,sans-serif">{lbl(val)}</text>')
+        )
+
+    paint_v,   paint_c   = get_zone("paint")
+    lmid_v,    lmid_c    = get_zone("left_mid")
+    rmid_v,    rmid_c    = get_zone("right_mid")
+    l3_v,      l3_c      = get_zone("left_3")
+    t3_v,      t3_c      = get_zone("top_3")
+    r3_v,      r3_c      = get_zone("right_3")
+    lc_v,      lc_c      = get_zone("left_corner")
+    rc_v,      rc_c      = get_zone("right_corner")
+
+    svg = (
+        '<svg viewBox="0 0 500 365" width="100%" xmlns="http://www.w3.org/2000/svg" '
+        'style="display:block;border-radius:10px;max-width:560px;">' +
+        # Background
+        '<rect width="500" height="365" fill="#0f172a" rx="10"/>' +
+        # Court outline
+        '<rect x="20" y="18" width="460" height="330" fill="none" stroke="#1e3a5f" stroke-width="1"/>' +
+        # Paint
+        '<rect x="175" y="178" width="150" height="165" fill="none" stroke="#1e3a5f" stroke-width="1"/>' +
+        # FT circle
+        '<ellipse cx="250" cy="178" rx="60" ry="45" fill="none" stroke="#1e3a5f" stroke-width="1" stroke-dasharray="5 4"/>' +
+        # FT line
+        '<line x1="175" y1="178" x2="325" y2="178" stroke="#1e3a5f" stroke-width="1"/>' +
+        # 3pt lines
+        '<line x1="42" y1="202" x2="42" y2="348" stroke="#1e3a5f" stroke-width="1"/>' +
+        '<line x1="458" y1="202" x2="458" y2="348" stroke="#1e3a5f" stroke-width="1"/>' +
+        '<path d="M 42 202 A 220 220 0 0 1 458 202" fill="none" stroke="#1e3a5f" stroke-width="1"/>' +
+        # Restricted area
+        '<path d="M 222 343 A 28 28 0 0 1 278 343" fill="none" stroke="#1e3a5f" stroke-width="1"/>' +
+        # Backboard + basket
+        '<rect x="218" y="10" width="64" height="6" rx="2" fill="none" stroke="#334155" stroke-width="1.5"/>' +
+        '<circle cx="250" cy="24" r="9" fill="none" stroke="#334155" stroke-width="1.5"/>' +
+        # Zone boxes
+        box(178, 181, 144, 161, paint_v,  paint_c,  "Paint") +
+        box(45,  180, 126, 98,  lmid_v,   lmid_c,   "Left Mid") +
+        box(329, 180, 126, 98,  rmid_v,   rmid_c,   "Right Mid") +
+        box(45,  58,  126, 118, l3_v,     l3_c,     "Left 3") +
+        box(179, 20,  142, 112, t3_v,     t3_c,     "Top 3") +
+        box(329, 58,  126, 118, r3_v,     r3_c,     "Right 3")
+    )
+
+    # Corner 3s as slim vertical strips
+    bg, bdr, txt = lc_c
+    svg += (
+        f'<rect x="22" y="202" width="20" height="144" rx="3" fill="{bg}" stroke="{bdr}" stroke-width="1"/>' +
+        f'<text x="32" y="285" text-anchor="middle" font-size="9" fill="{txt}" font-family="system-ui,sans-serif" ' +
+        f'transform="rotate(-90 32 285)">C3 {lbl(lc_v)}</text>'
+    )
+    bg, bdr, txt = rc_c
+    svg += (
+        f'<rect x="458" y="202" width="20" height="144" rx="3" fill="{bg}" stroke="{bdr}" stroke-width="1"/>' +
+        f'<text x="468" y="285" text-anchor="middle" font-size="9" fill="{txt}" font-family="system-ui,sans-serif" ' +
+        f'transform="rotate(90 468 285)">C3 {lbl(rc_v)}</text>'
+    )
+
+    # Legend
+    legend = [("#22c55e","45%+"),("#eab308","38-45%"),("#f97316","30-38%"),("#ef4444","<30%"),("#334155","No data")]
+    lx = 20
+    for color, label_txt in legend:
+        svg += (
+            f'<rect x="{lx}" y="353" width="8" height="8" rx="2" fill="{color}"/>' +
+            f'<text x="{lx+10}" y="361" font-size="8" fill="#94a3b8" font-family="system-ui,sans-serif">{label_txt}</text>'
+        )
+        lx += 82
+    svg += '</svg>'
+    return svg
+
+
+def _UNUSED_zone_chart_svg(zones=None):
     z = zones or {}
     paint        = fmt(z.get("paint"))
     left_mid     = fmt(z.get("left_mid"))
@@ -228,12 +341,59 @@ def render_player_card(stats, bio, zones=None):
 
     zone_svg = zone_chart_svg(zones)
 
-    # Fetch career stats for top 5 seasons (cached once per session via lru-style)
+    # Career stats for top 5 seasons
     _career = get_player_career_stats(name)
     _best_seasons_html = render_best_seasons(
         _career.get("top_seasons", []) if "error" not in _career else [],
-        border, on_bg, bg
+        border, on_bg, bg, on_bg_muted
     )
+
+    # Career playoff stats — inline in card
+    _po = get_player_playoff_stats(name)
+    _po_html = ""
+    if "error" not in _po and _po.get("career_games", 0) > 0:
+        def _po_box(label, val, fmt=None):
+            v = fmt(val) if (fmt and val is not None) else (val if val is not None else DASH)
+            return stat_box_html(label, v)
+
+        # Current season playoffs (if available and different from career)
+        curr = _po.get("current_season")
+        curr_html = ""
+        if curr and curr.get("gp", 0) > 0:
+            curr_html = (
+                f'<p style="font-size:11px;text-transform:uppercase;letter-spacing:.07em;'
+                f'color:{on_bg};margin:8px 0 6px;font-weight:600;">'
+                f'2025{ENDASH}26 Playoffs '
+                f'<span style="font-size:10px;font-weight:400;color:{on_bg_muted};">({curr["gp"]} GP)</span></p>'
+                f'<div class="stat-grid" style="grid-template-columns:repeat(5,1fr);">'
+                + _po_box("PPG", curr.get("ppg"))
+                + _po_box("REB", curr.get("reb"))
+                + _po_box("AST", curr.get("ast"))
+                + _po_box("STL", curr.get("stl"))
+                + _po_box("BLK", curr.get("blk"))
+                + '</div>'
+            )
+
+        _po_html = (
+            f'<div style="border-top:1px solid {border};padding-top:10px;">'
+            + curr_html
+            + f'<p style="font-size:11px;text-transform:uppercase;letter-spacing:.07em;'
+              f'color:{on_bg};margin:{"8px" if curr_html else "0"} 0 6px;font-weight:600;">Career Playoff Averages '
+              f'<span style="font-size:10px;font-weight:400;color:{on_bg_muted};">({_po["career_games"]} GP, {_po.get("seasons",0)} seasons)</span></p>'
+            f'<div class="stat-grid" style="grid-template-columns:repeat(6,1fr);">'
+            + _po_box("PPG",  _po.get("career_ppg"))
+            + _po_box("REB",  _po.get("career_reb"))
+            + _po_box("AST",  _po.get("career_ast"))
+            + _po_box("STL",  _po.get("career_stl"))
+            + _po_box("BLK",  _po.get("career_blk"))
+            + _po_box("TS%",  _po.get("career_ts_pct"), fmt=lambda x: f"{x}%")
+            + '</div>'
+            f'<div class="stat-grid" style="grid-template-columns:repeat(3,1fr);margin-top:6px;">'
+            + _po_box("FG%",  _po.get("career_fg_pct"), fmt=lambda x: f"{round(x*100,1)}%")
+            + _po_box("3PT%", _po.get("career_3_pct"),  fmt=lambda x: f"{round(x*100,1)}%")
+            + _po_box("FT%",  _po.get("career_ft_pct"), fmt=lambda x: f"{round(x*100,1)}%")
+            + '</div></div>'
+        )
 
     # Accolades for left panel
     ac = stats.get("_accolades", {})
@@ -299,6 +459,7 @@ def render_player_card(stats, bio, zones=None):
           f'<p style="font-size:11px;text-transform:uppercase;letter-spacing:.07em;color:{on_bg};margin:0 0 6px;font-weight:600;">Shot Zones</p>'
           + zone_svg
           + '</div>'
+        + _po_html
         + _best_seasons_html
         + '</div>'
     )
@@ -448,10 +609,11 @@ def render_team_card(stats):
 # Best seasons renderer (shared by both active + career cards)
 # ---------------------------------------------------------------------------
 
-def render_best_seasons(top_seasons, border, on_bg, bg):
-    """Render top 5 seasons table with award badges."""
+def render_best_seasons(top_seasons, border, on_bg, bg, on_bg_muted=None):
+    """Render top 5 seasons table with award badges. Uses theme colors for readability."""
     if not top_seasons:
         return ""
+    muted = on_bg_muted or on_bg
 
     def badge(text, color):
         return (
@@ -465,50 +627,44 @@ def render_best_seasons(top_seasons, border, on_bg, bg):
     rows_html = ""
     for s in top_seasons:
         badges = ""
-        if s.get("ring"):       badges += badge("Ring", "#ca8a04")
-        if s.get("finals_mvp"): badges += badge("FMVP", "#9333ea")
-        if s.get("mvp"):        badges += badge("MVP",  "#1d4ed8")
+        if s.get("ring"):       badges += badge("Ring",     "#ca8a04")
+        if s.get("finals_mvp"): badges += badge("FMVP",     "#9333ea")
+        if s.get("mvp"):        badges += badge("MVP",      "#1d4ed8")
         if s.get("all_star"):   badges += badge("All-Star", "#16a34a")
         if s.get("all_nba"):    badges += badge("All-NBA",  "#0891b2")
         if s.get("dpoy"):       badges += badge("DPOY",     "#dc2626")
 
         rows_html += (
             f'<tr style="border-bottom:0.5px solid {border};">'
-            f'<td style="padding:7px 8px;font-size:12px;font-weight:600;color:{on_bg};white-space:nowrap;">'
-            f'{s.get("season","")}</td>'
-            f'<td style="padding:7px 6px;font-size:12px;color:#555;">{s.get("team","")}</td>'
-            f'<td style="padding:7px 6px;text-align:center;font-size:13px;font-weight:700;color:{on_bg};">'
-            f'{s.get("ppg", DASH)}</td>'
-            f'<td style="padding:7px 6px;text-align:center;font-size:12px;color:#555;">'
-            f'{s.get("reb", DASH)}</td>'
-            f'<td style="padding:7px 6px;text-align:center;font-size:12px;color:#555;">'
-            f'{s.get("ast", DASH)}</td>'
-            f'<td style="padding:7px 6px;text-align:center;font-size:12px;color:#555;">'
-            f'{fmt_pct(s.get("fg_pct"))}</td>'
-            f'<td style="padding:7px 6px;text-align:center;font-size:12px;color:#555;">'
-            f'{fmt_pct(s.get("three_pct"))}</td>'
-            f'<td style="padding:7px 6px;text-align:center;font-size:12px;color:#555;">'
-            f'{s.get("ts_pct", DASH)}{"%" if s.get("ts_pct") else ""}</td>'
+            f'<td style="padding:7px 8px;font-size:12px;font-weight:600;color:{on_bg};white-space:nowrap;">{s.get("season","")}</td>'
+            f'<td style="padding:7px 6px;font-size:12px;color:{muted};">{s.get("team","")}</td>'
+            f'<td style="padding:7px 6px;text-align:center;font-size:12px;color:{muted};">{s.get("gp", DASH)}</td>'
+            f'<td style="padding:7px 6px;text-align:center;font-size:13px;font-weight:700;color:{on_bg};">{s.get("ppg", DASH)}</td>'
+            f'<td style="padding:7px 6px;text-align:center;font-size:12px;color:{muted};">{s.get("reb", DASH)}</td>'
+            f'<td style="padding:7px 6px;text-align:center;font-size:12px;color:{muted};">{s.get("ast", DASH)}</td>'
+            f'<td style="padding:7px 6px;text-align:center;font-size:12px;color:{muted};">{fmt_pct(s.get("fg_pct"))}</td>'
+            f'<td style="padding:7px 6px;text-align:center;font-size:12px;color:{muted};">{fmt_pct(s.get("three_pct"))}</td>'
+            f'<td style="padding:7px 6px;text-align:center;font-size:12px;color:{muted};">{s.get("ts_pct", DASH)}{"%" if s.get("ts_pct") else ""}</td>'
             f'<td style="padding:7px 8px;text-align:left;">{badges}</td>'
             f'</tr>'
         )
 
+    header_style = f'font-size:10px;text-transform:uppercase;color:{muted};font-weight:600;'
     return (
         f'<div style="border-top:1px solid {border};padding-top:10px;overflow-x:auto;">'
-        f'<p style="font-size:11px;text-transform:uppercase;letter-spacing:.07em;color:{on_bg};'
-        f'margin:0 0 6px;font-weight:600;">Top 5 Seasons</p>'
-        f'<table style="width:100%;border-collapse:collapse;background:{bg};">'
+        f'<p style="font-size:11px;text-transform:uppercase;letter-spacing:.07em;color:{on_bg};margin:0 0 6px;font-weight:600;">Top 5 Seasons</p>'
+        f'<table style="width:100%;border-collapse:collapse;">'
         f'<thead><tr style="border-bottom:1px solid {border};">'
-        f'<th style="padding:5px 8px;font-size:10px;text-transform:uppercase;color:#888;'
-        f'font-weight:600;text-align:left;">Season</th>'
-        f'<th style="padding:5px 6px;font-size:10px;text-transform:uppercase;color:#888;font-weight:600;">Team</th>'
-        f'<th style="padding:5px 6px;font-size:10px;text-transform:uppercase;color:#888;font-weight:600;">PPG</th>'
-        f'<th style="padding:5px 6px;font-size:10px;text-transform:uppercase;color:#888;font-weight:600;">REB</th>'
-        f'<th style="padding:5px 6px;font-size:10px;text-transform:uppercase;color:#888;font-weight:600;">AST</th>'
-        f'<th style="padding:5px 6px;font-size:10px;text-transform:uppercase;color:#888;font-weight:600;">FG%</th>'
-        f'<th style="padding:5px 6px;font-size:10px;text-transform:uppercase;color:#888;font-weight:600;">3PT%</th>'
-        f'<th style="padding:5px 6px;font-size:10px;text-transform:uppercase;color:#888;font-weight:600;">TS%</th>'
-        f'<th style="padding:5px 6px;font-size:10px;text-transform:uppercase;color:#888;font-weight:600;">Awards</th>'
+        f'<th style="padding:5px 8px;{header_style}text-align:left;">Season</th>'
+        f'<th style="padding:5px 6px;{header_style}">Team</th>'
+        f'<th style="padding:5px 6px;{header_style}">GP</th>'
+        f'<th style="padding:5px 6px;{header_style}">PPG</th>'
+        f'<th style="padding:5px 6px;{header_style}">REB</th>'
+        f'<th style="padding:5px 6px;{header_style}">AST</th>'
+        f'<th style="padding:5px 6px;{header_style}">FG%</th>'
+        f'<th style="padding:5px 6px;{header_style}">3PT%</th>'
+        f'<th style="padding:5px 6px;{header_style}">TS%</th>'
+        f'<th style="padding:5px 6px;{header_style}">Awards</th>'
         f'</tr></thead>'
         f'<tbody>{rows_html}</tbody></table></div>'
     )
@@ -656,7 +812,7 @@ def render_career_card(player_name, career, bio, accolades):
         )
 
     best_seasons_html = render_best_seasons(
-        career.get("top_seasons", []), border, on_bg, bg
+        career.get("top_seasons", []), border, on_bg, bg, on_bg_muted
     )
 
     right_panel = (
@@ -1143,11 +1299,14 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-tab_lookup, tab_standings, tab_player_cmp, tab_team_cmp = st.tabs([
+tab_lookup, tab_standings, tab_schedule, tab_boxscore, tab_player_cmp, tab_team_cmp, tab_draft = st.tabs([
     "Search",
     "Standings",
+    "Schedule",
+    "Games",
     "Compare Players",
     "Compare Teams",
+    "Draft Lottery",
 ])
 
 
@@ -1220,13 +1379,30 @@ with tab_lookup:
                 stats["_accolades"] = acols
                 render_player_card(stats, bio, zones)
             else:
-                career = get_player_career_stats(player_name)
+                # Try career stats (retired player)
+                with st.spinner(f"Looking up career stats for {player_name}..."):
+                    career = get_player_career_stats(player_name)
+                    if "error" not in career:
+                        bio   = get_player_bio(player_name)
+                        acols = get_player_accolades(player_name)
+                    else:
+                        # Last fallback: try with first/last name only
+                        parts = player_name.split()
+                        alt   = None
+                        if len(parts) >= 2:
+                            alt = f"{parts[0]} {parts[-1]}"
+                        if alt and alt != player_name:
+                            career = get_player_career_stats(alt)
+                            if "error" not in career:
+                                bio   = get_player_bio(alt)
+                                acols = get_player_accolades(alt)
+                                player_name = alt
+
                 if "error" not in career:
-                    bio    = get_player_bio(player_name)
-                    acols  = get_player_accolades(player_name)
                     render_career_card(player_name, career, bio, acols)
                 else:
-                    st.warning(f"Could not find stats for {player_name}.")
+                    st.warning(f"Could not find stats for {player_name}. "
+                               f"Try the full name (e.g. 'Kareem Abdul-Jabbar', 'Michael Jordan').")
 
         elif teams and not is_game_log:
             with st.spinner("Loading team data..."):
@@ -1304,7 +1480,771 @@ with tab_standings:
 
 
 # ---------------------------------------------------------------------------
-# Tab 3 — Compare Players
+# Tab 3 — Schedule
+# ---------------------------------------------------------------------------
+
+with tab_schedule:
+    st.markdown("#### Team Schedule")
+    all_teams_sched = sorted(list(set(TEAM_MAP.values())))
+    sched_col1, sched_col2 = st.columns([2, 1])
+    with sched_col1:
+        sched_team = st.selectbox("Select team", all_teams_sched, key="sched_team")
+    with sched_col2:
+        sched_season = st.selectbox("Season", [
+            "2025-26", "2024-25", "2023-24", "2022-23", "2021-22"
+        ], key="sched_season")
+
+    if st.button("Load Schedule", key="btn_sched"):
+        with st.spinner(f"Loading {sched_team} schedule..."):
+            sched = get_team_schedule(sched_team, sched_season)
+
+        if isinstance(sched, dict) and "error" in sched:
+            st.warning(sched["error"])
+        elif sched:
+            wins   = sum(1 for g in sched if g.get("result") == "W")
+            losses = sum(1 for g in sched if g.get("result") == "L")
+            po_games = [g for g in sched if g.get("playoffs")]
+            reg_games = [g for g in sched if not g.get("playoffs")]
+
+            st.markdown(f"**{sched_team}** — {sched_season} | {wins}W {losses}L | {len(sched)} games")
+
+            for section_label, games in [("Regular Season", reg_games), ("Playoffs", po_games)]:
+                if not games:
+                    continue
+                st.markdown(f"**{section_label}**")
+                rows_html = ""
+                for g in sorted(games, key=lambda x: x["date"]):
+                    result = g.get("result", "")
+                    home_away = "vs." if g.get("home") else "@"
+                    result_color = "#16a34a" if result == "W" else ("#dc2626" if result == "L" else "#888")
+                    cum_w = g.get("cum_w")
+                    cum_l = g.get("cum_l")
+                    record_str = f"{cum_w}-{cum_l}" if cum_w is not None else ""
+                    rows_html += (
+                        f'<tr style="border-bottom:0.5px solid #f0f0f0;'
+                        f'{"background:#f0fff4;" if g.get("playoffs") else ""}">'
+                        f'<td style="padding:7px 10px;font-size:12px;color:#555;">{g["date"]}</td>'
+                        f'<td style="padding:7px 10px;font-size:13px;font-weight:500;color:#111;">'
+                        f'{home_away} {g["opponent"]}</td>'
+                        f'<td style="padding:7px 10px;text-align:center;font-size:13px;font-weight:700;'
+                        f'color:{result_color};">{result if result else "—"}</td>'
+                        f'<td style="padding:7px 10px;text-align:center;font-size:12px;color:#555;">'
+                        f'{g.get("pts","") or "—"}</td>'
+                        f'<td style="padding:7px 10px;text-align:center;font-size:12px;'
+                        f'font-weight:{"600" if record_str else "400"};color:#333;">'
+                        f'{record_str}</td>'
+                        f'</tr>'
+                    )
+                st.markdown(
+                    f'<div class="card" style="padding:0;overflow-x:auto;">'
+                    f'<table style="width:100%;border-collapse:collapse;">'
+                    f'<thead><tr style="background:#f7f7f7;border-bottom:1px solid #e0e0e0;">'
+                    f'<th style="padding:7px 10px;text-align:left;font-size:10px;text-transform:uppercase;color:#888;">Date</th>'
+                    f'<th style="padding:7px 10px;text-align:left;font-size:10px;text-transform:uppercase;color:#888;">Opponent</th>'
+                    f'<th style="padding:7px 10px;text-align:center;font-size:10px;text-transform:uppercase;color:#888;">W/L</th>'
+                    f'<th style="padding:7px 10px;text-align:center;font-size:10px;text-transform:uppercase;color:#888;">PTS</th>'
+                    f'<th style="padding:7px 10px;text-align:center;font-size:10px;text-transform:uppercase;color:#888;">Record</th>'
+                    f'</tr></thead><tbody>{rows_html}</tbody></table></div>',
+                    unsafe_allow_html=True
+                )
+
+
+# ---------------------------------------------------------------------------
+# Tab 4 — Games (Calendar + Box Score)
+# ---------------------------------------------------------------------------
+
+with tab_boxscore:
+    import datetime as _dt
+
+    st.markdown("#### Games")
+
+    # ── Date picker ───────────────────────────────────────────────────────
+    gcol1, gcol2 = st.columns([3, 1])
+    with gcol1:
+        selected_date = st.date_input(
+            "Select date",
+            value=_dt.date.today(),
+            min_value=_dt.date(2024, 10, 1),
+            max_value=_dt.date(2026, 9, 1),
+            key="games_date",
+        )
+    with gcol2:
+        games_season = st.selectbox(
+            "Season", ["2025-26", "2024-25", "2023-24"], key="games_season"
+        )
+
+    date_str   = selected_date.strftime("%Y-%m-%d")
+    is_today  = selected_date == _dt.date.today()
+    is_future = selected_date > _dt.date.today()
+
+    # Auto-detect season type from date
+    games_stype = detect_season_type(selected_date)
+
+    badge_color = {
+        "Playoffs":       "#1d4ed8",
+        "PlayIn":         "#d97706",
+        "Regular Season": "#16a34a",
+    }.get(games_stype, "#888")
+
+    st.markdown(
+        f'<div style="display:flex;align-items:center;gap:10px;margin-bottom:6px;">' +
+        f'<p style="font-size:16px;font-weight:700;margin:0;">{selected_date.strftime("%A, %B %d, %Y")}</p>' +
+        f'<span style="font-size:11px;font-weight:700;padding:2px 10px;border-radius:99px;' +
+        f'background:{badge_color};color:#fff;">{games_stype}</span>' +
+        f'</div>',
+        unsafe_allow_html=True
+    )
+
+    # ── Load games ────────────────────────────────────────────────────────
+    if is_today:
+        rc1, rc2 = st.columns([5, 1])
+        with rc2:
+            if st.button("⟳ Refresh", key="refresh_games", use_container_width=True):
+                st.rerun()
+
+    with st.spinner("Loading games..."):
+        if is_today:
+            # Live API for today
+            day_games = get_todays_games(date_str)
+            if not day_games:
+                day_games = get_games_on_date(date_str, games_season, games_stype)
+        else:
+            # get_games_on_date handles both past (leaguegamefinder) and future (scoreboardv2)
+            day_games = get_games_on_date(date_str, games_season, games_stype)
+
+    if not day_games:
+        st.info("No games found for this date." + (" Check back closer to tip-off." if is_future else ""))
+    else:
+        st.markdown(f"*{len(day_games)} game{'s' if len(day_games)!=1 else ''}*")
+
+        # Show game tiles — click to load box score
+        game_cols = st.columns(min(len(day_games), 3))
+        selected_game_id = st.session_state.get("selected_game_id")
+        selected_game    = st.session_state.get("selected_game_meta")
+
+        for i, g in enumerate(day_games):
+            with game_cols[i % 3]:
+                away_c    = get_team_colors(g["away_name"])
+                home_c    = get_team_colors(g["home_name"])
+                away_logo = get_team_logo_url(g["away_name"])
+                home_logo = get_team_logo_url(g["home_name"])
+
+                is_live   = g.get("is_live", False)
+                is_final  = g.get("finished", False)
+                status_txt= g.get("status_txt", "")
+
+                if (is_final or is_live) and g.get("away_pts") is not None:
+                    away_score_str = str(g["away_pts"])
+                    home_score_str = str(g.get("home_pts") or 0)
+                    away_won = is_final and g["away_pts"] > (g.get("home_pts") or 0)
+                else:
+                    away_score_str = home_score_str = ""
+                    away_won = False
+
+                if is_live:
+                    status_badge = (
+                        f'<span style="font-size:9px;font-weight:700;padding:1px 6px;' +
+                        f'border-radius:99px;background:#dc2626;color:#fff;">● LIVE {status_txt}</span>'
+                    )
+                elif is_final:
+                    status_badge = '<span style="font-size:9px;color:#888;">Final</span>'
+                else:
+                    status_badge = f'<span style="font-size:9px;color:#888;">{status_txt}</span>' if status_txt else ""
+
+                # Series score in tile
+                away_sw = g.get("away_series_wins", 0) or 0
+                home_sw = g.get("home_series_wins", 0) or 0
+                series_tile_html = ""
+                if games_stype == "Playoffs" and (away_sw or home_sw or g.get("series_text")):
+                    series_str = g.get("series_text") or f"{away_sw}–{home_sw}"
+                    series_tile_html = (
+                        f'<span style="font-size:9px;font-weight:600;color:#555;margin-left:8px;">{series_str}</span>'
+                    )
+
+                def logo_html(url, size=28):
+                    return (f'<img src="{url}" style="width:{size}px;height:{size}px;object-fit:contain;" ' +
+                            'onerror="this.style.display=\'none\'">') if url else ""
+
+                border = "2px solid #dc2626" if is_live else "1px solid #e0e0e0"
+                tile_html = (
+                    f'<div style="border:{border};border-radius:10px;overflow:hidden;background:#fff;margin-bottom:4px;">' +
+                    f'<div style="display:flex;align-items:center;gap:8px;padding:10px 12px;background:{away_c["pastel_bg"]};">' +
+                    logo_html(away_logo) +
+                    f'<span style="font-size:13px;font-weight:{"700" if away_won else "500"};color:{away_c["on_bg"]};flex:1;">{g["away_name"].split()[-1]}</span>' +
+                    f'<span style="font-size:15px;font-weight:{"800" if away_won else "500"};color:{away_c["on_bg"]};">{away_score_str}</span>' +
+                    f'</div>' +
+                    f'<div style="display:flex;align-items:center;gap:8px;padding:10px 12px;background:{home_c["pastel_bg"]};">' +
+                    logo_html(home_logo) +
+                    f'<span style="font-size:13px;font-weight:{"700" if not away_won and is_final else "500"};color:{home_c["on_bg"]};flex:1;">{g["home_name"].split()[-1]}</span>' +
+                    f'<span style="font-size:15px;font-weight:{"800" if not away_won and is_final else "500"};color:{home_c["on_bg"]};">{home_score_str}</span>' +
+                    f'</div>' +
+                    f'<div style="padding:4px 12px;background:#f8f9fa;border-top:0.5px solid #e0e0e0;">{status_badge}{series_tile_html}</div>' +
+                    f'</div>'
+                )
+                st.markdown(tile_html, unsafe_allow_html=True)
+
+                btn_label    = "View Box Score" if (is_final or is_live) else "Scheduled"
+                btn_disabled = not (is_final or is_live)
+                if st.button(btn_label, key=f"game_btn_{g['game_id']}", use_container_width=True, disabled=btn_disabled):
+                    st.session_state["selected_game_id"]   = g["game_id"]
+                    st.session_state["selected_game_meta"] = g
+                    st.session_state["selected_stype"]     = games_stype
+                    st.rerun()
+
+        # Auto-refresh AFTER tiles are rendered
+        has_live = any(g.get("is_live") for g in day_games)
+        if has_live and is_today:
+            import time as _time
+            st.caption("🔴 Live — scores update every 30 seconds")
+            _time.sleep(30)
+            st.rerun()
+
+    # ── Box score display ─────────────────────────────────────────────────
+    if st.session_state.get("selected_game_id"):
+        g       = st.session_state.get("selected_game_meta", {})
+        game_id = st.session_state["selected_game_id"]
+        stype   = st.session_state.get("selected_stype", "Regular Season")
+
+        with st.spinner("Loading box score..."):
+            from agent.tools import ABBR_TO_TEAM
+            # Use game_id directly — avoids re-searching by team/date which can miss
+            result_bs = get_boxscore_by_game_id(game_id, season_type=stype)
+
+            # Patch in known meta from the tile
+            if "error" not in result_bs:
+                if not result_bs.get("home_abbr") and g.get("home_abbr"):
+                    result_bs["home_abbr"] = g["home_abbr"]
+                if not result_bs.get("away_abbr") and g.get("away_abbr"):
+                    result_bs["away_abbr"] = g["away_abbr"]
+                if not result_bs.get("date") and g.get("date"):
+                    result_bs["date"] = g["date"]
+
+        if "error" in result_bs:
+            st.warning(result_bs["error"])
+        else:
+            teams_data      = result_bs.get("teams", {})
+            home_abbr       = result_bs.get("home_abbr", "").strip().upper()
+            away_abbr       = result_bs.get("away_abbr", "").strip().upper()
+            game_number     = result_bs.get("game_number", 0)
+            away_series_w   = result_bs.get("series_away_wins", 0)
+            home_series_w   = result_bs.get("series_home_wins", 0)
+            home_seed       = result_bs.get("home_seed")
+            away_seed       = result_bs.get("away_seed")
+            is_playoffs     = result_bs.get("season_type","") == "Playoffs"
+            game_date       = result_bs.get("date", "")
+            arena           = result_bs.get("arena", "")
+            attendance      = result_bs.get("attendance", "")
+
+            home_full = ABBR_TO_TEAM.get(home_abbr, home_abbr)
+            away_full = ABBR_TO_TEAM.get(away_abbr, away_abbr)
+            home_c    = get_team_colors(home_full)
+            away_c    = get_team_colors(away_full)
+
+            scores     = {a.strip().upper(): teams_data[a]["total_pts"] for a in teams_data}
+            home_score = scores.get(home_abbr, 0)
+            away_score = scores.get(away_abbr, 0)
+            home_wins  = home_score > away_score
+
+            def _logo(name, sz=44):
+                url = get_team_logo_url(name)
+                return (f'<img src="{url}" style="width:{sz}px;height:{sz}px;object-fit:contain;" ' +
+                        'onerror="this.style.display=\'none\'">') if url else ""
+
+            # ── Scoreboard ───────────────────────────────────────────────
+            # Date + game info line
+            game_label = ""
+            if is_playoffs and game_number:
+                game_label = f"Game {game_number}"
+            meta_parts = [game_date]
+            if arena:      meta_parts.append(arena)
+            if attendance: meta_parts.append(f"Att: {attendance}")
+
+            def scoreboard_side(full, abbr, score, seed, series_w, colors, is_home, won):
+                primary = colors["primary"]
+                on_bg   = colors["on_bg"]
+                logo    = _logo(full, 44)
+                align   = "right" if is_home else "left"
+                seed_badge = (
+                    f'<span style="font-size:11px;font-weight:800;padding:2px 8px;border-radius:99px;' +
+                    f'background:rgba(255,255,255,0.18);color:#fff;">#{seed}</span>'
+                ) if seed else ""
+                series_block = (
+                    f'<div style="text-align:center;padding:0 12px;">' +
+                    f'<p style="font-size:30px;font-weight:900;color:rgba(255,255,255,0.95);margin:0;line-height:1;">{series_w}</p>' +
+                    f'<p style="font-size:9px;color:rgba(255,255,255,0.55);margin:0;text-transform:uppercase;letter-spacing:.06em;">wins</p>' +
+                    f'</div>'
+                ) if (is_playoffs and game_number) else ""
+                return (
+                    f'<div style="flex:1;background:{primary};padding:18px 22px;' +
+                    f'display:flex;flex-direction:{"row-reverse" if is_home else "row"};' +
+                    f'align-items:center;gap:14px;">' +
+                    logo +
+                    f'<div style="flex:1;text-align:{align};">' +
+                    f'<p style="font-size:10px;font-weight:600;color:rgba(255,255,255,0.55);margin:0;text-transform:uppercase;">{"Home" if is_home else "Away"}</p>' +
+                    f'<div style="display:flex;align-items:center;gap:8px;{"flex-direction:row-reverse;" if is_home else ""}margin:2px 0;">' +
+                    f'<p style="font-size:17px;font-weight:700;color:{on_bg};margin:0;">{full}</p>' +
+                    seed_badge +
+                    f'</div>' +
+                    f'<p style="font-size:44px;font-weight:{"900" if won else "600"};' +
+                    f'color:{"#fff" if won else "rgba(255,255,255,0.4)"};margin:0;line-height:1;">{score}</p>' +
+                    f'</div>' +
+                    series_block +
+                    f'</div>'
+                )
+
+            mid_html = (
+                f'<div style="background:#111;padding:14px 18px;text-align:center;' +
+                f'min-width:130px;display:flex;flex-direction:column;justify-content:center;gap:6px;">' +
+                (f'<p style="font-size:14px;font-weight:800;color:#fff;margin:0;letter-spacing:.02em;">{game_label}</p>' if game_label else "") +
+                f'<p style="font-size:11px;color:#666;margin:0;">{game_date}</p>' +
+                (f'<p style="font-size:22px;font-weight:900;color:#fff;margin:0;letter-spacing:.02em;">{away_series_w}–{home_series_w}</p>' +
+                 f'<p style="font-size:9px;color:#555;margin:0;text-transform:uppercase;">series</p>'
+                 if is_playoffs and game_number else "") +
+                f'</div>'
+            )
+
+            st.markdown(
+                f'<div style="display:flex;border-radius:14px;overflow:hidden;' +
+                f'box-shadow:0 4px 24px rgba(0,0,0,0.3);margin-bottom:22px;">' +
+                scoreboard_side(away_full, away_abbr, away_score, away_seed, away_series_w, away_c, False, not home_wins) +
+                mid_html +
+                scoreboard_side(home_full, home_abbr, home_score, home_seed, home_series_w, home_c, True, home_wins) +
+                f'</div>',
+                unsafe_allow_html=True
+            )
+
+            # ── Box scores ───────────────────────────────────────────────
+            def build_bs_card(abbr, tdata, colors):
+                players = tdata["players"]
+                if not players:
+                    return ""
+                full    = ABBR_TO_TEAM.get(abbr.upper(), abbr)
+                primary = colors["primary"]
+                on_bg   = colors["on_bg"]
+                bg      = colors["pastel_bg"]
+                muted   = colors["on_bg_muted"]
+                border  = colors["pastel_border"]
+
+                th = f'font-size:9px;text-transform:uppercase;font-weight:600;color:{muted};padding:6px 5px;text-align:center;'
+                head = (
+                    f'<tr style="background:{primary}22;border-bottom:1px solid {border};">' +
+                    f'<th style="{th}text-align:left;min-width:90px;">Player</th>' +
+                    f'<th style="{th}">MIN</th><th style="{th}">PTS</th><th style="{th}">REB</th>' +
+                    f'<th style="{th}">AST</th><th style="{th}">STL</th><th style="{th}">BLK</th>' +
+                    f'<th style="{th}">TOV</th><th style="{th}">FG</th><th style="{th}">3PT</th>' +
+                    f'<th style="{th}">FT</th><th style="{th}">+/-</th></tr>'
+                )
+                max_pts = max(p["pts"] for p in players)
+                rows = ""
+                for p in players:
+                    pm   = p["plus_minus"]
+                    pms  = f'{"+" if pm>=0 else ""}{pm}'
+                    pmc  = "#16a34a" if pm>0 else ("#dc2626" if pm<0 else muted)
+                    top  = p["pts"] == max_pts
+                    td   = f'padding:7px 5px;text-align:center;font-size:12px;color:{muted};'
+                    rows += (
+                        f'<tr style="border-bottom:0.5px solid {border};">' +
+                        f'<td style="padding:7px 8px;font-size:12px;font-weight:{"700" if top else "500"};color:{on_bg};">{p["name"]}</td>' +
+                        f'<td style="{td}font-size:11px;">{p["min"]}</td>' +
+                        f'<td style="{td}font-size:13px;font-weight:{"700" if top else "500"};color:{on_bg};">{p["pts"]}</td>' +
+                        f'<td style="{td}color:{on_bg};">{p["reb"]}</td>' +
+                        f'<td style="{td}color:{on_bg};">{p["ast"]}</td>' +
+                        f'<td style="{td}">{p["stl"]}</td>' +
+                        f'<td style="{td}">{p["blk"]}</td>' +
+                        f'<td style="{td}">{p["tov"]}</td>' +
+                        f'<td style="{td}">{p["fg"]}</td>' +
+                        f'<td style="{td}">{p["fg3"]}</td>' +
+                        f'<td style="{td}">{p["ft"]}</td>' +
+                        f'<td style="{td}font-weight:600;color:{pmc};">{pms}</td>' +
+                        f'</tr>'
+                    )
+                return (
+                    f'<div style="border:1px solid {border};border-radius:10px;overflow:hidden;">' +
+                    f'<div style="background:{primary};padding:10px 14px;display:flex;align-items:center;gap:10px;">' +
+                    _logo(full, 26) +
+                    f'<span style="font-size:14px;font-weight:700;color:{on_bg};flex:1;">{full}</span>' +
+                    f'<span style="font-size:22px;font-weight:800;color:{on_bg};">{tdata["total_pts"]}</span>' +
+                    f'</div>' +
+                    f'<div style="overflow-x:auto;background:{bg};">' +
+                    f'<table style="width:100%;border-collapse:collapse;">' +
+                    f'<thead>{head}</thead><tbody>{rows}</tbody></table></div></div>'
+                )
+
+            all_keys   = list(teams_data.keys())
+            away_key   = next((a for a in all_keys if a.strip().upper()==away_abbr), all_keys[0])
+            home_key   = next((a for a in all_keys if a.strip().upper()==home_abbr), all_keys[-1])
+            left_html  = build_bs_card(away_key, teams_data[away_key], away_c)
+            right_html = build_bs_card(home_key, teams_data[home_key], home_c)
+
+            st.markdown(
+                f'<div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;">' +
+                left_html + right_html + '</div>',
+                unsafe_allow_html=True
+            )
+
+        if st.button("Back to games", key="back_to_games"):
+            del st.session_state["selected_game_id"]
+            if "selected_game_meta" in st.session_state:
+                del st.session_state["selected_game_meta"]
+            st.rerun()
+
+# Tab 5 — Draft Lottery Simulator
+# ---------------------------------------------------------------------------
+
+with tab_draft:
+    import random
+
+    # Official 2026 NBA lottery odds (per NBA.com — top 3 teams ALL share 14%)
+    # Combinations out of 1000 (1001 total, one unused)
+    LOTTERY_COMBOS = [140, 140, 140, 125, 105, 90, 75, 60, 45, 30, 20, 15, 10, 5]
+    LOTTERY_PCT    = [14.0, 14.0, 14.0, 12.5, 10.5, 9.0, 7.5, 6.0, 4.5, 3.0, 2.0, 1.5, 1.0, 0.5]
+
+    # 2025-26 confirmed play-in losers: Golden State, LA Clippers (West), Miami, Charlotte (East)
+    # Traded pick situations (source: Tankathon / Hoops Rumors)
+    TRADED_PICKS = {
+        "New Orleans Pelicans": {"owner": "Atlanta Hawks",         "protected": None,
+                                 "note": "→ ATL (Hawks get better of NOP/MIL picks)"},
+        "LA Clippers":          {"owner": "Oklahoma City Thunder", "protected": None,
+                                 "note": "→ OKC (best of OKC/HOU/LAC three-way deal)"},
+        "Washington Wizards":   {"owner": "New York Knicks",       "protected": 8,
+                                 "note": "→ NYK if pick #9-14; WAS keeps if top-8"},
+        "Phoenix Suns":         {"owner": "Washington Wizards",   "protected": None,
+                                 "note": "WAS has swap rights (Brad Beal trade)"},
+    }
+
+    def run_lottery_sim(teams):
+        """
+        Simulate the NBA lottery using weighted combination draws.
+        Returns list of (pick, team_dict) tuples in order 1-14.
+        """
+        names   = [t["name"] for t in teams]
+        weights = LOTTERY_PCT[:len(names)]
+        pool_n  = list(names)
+        pool_w  = list(weights)
+        lottery_picks = {}   # pick -> name
+
+        # Draw picks 1-4
+        for pick in range(1, 5):
+            tot    = sum(pool_w)
+            norm   = [w / tot for w in pool_w]
+            idx    = random.choices(range(len(pool_n)), weights=norm, k=1)[0]
+            winner = pool_n.pop(idx)
+            pool_w.pop(idx)
+            lottery_picks[pick] = winner
+
+        # Remaining teams fill 5-14 in standing order (worst first = lowest seed)
+        remaining = [n for n in names if n not in lottery_picks.values()]
+        for i, name in enumerate(remaining, 5):
+            lottery_picks[i] = name
+
+        return [(p, lottery_picks[p]) for p in range(1, 15)]
+
+    def compute_odds_matrix(teams, n_sim=50000):
+        """
+        Monte Carlo: probability of each team landing each pick.
+        Returns dict: team_name -> [pct_pick1, pct_pick2, ..., pct_pick14]
+        """
+        counts = {t["name"]: [0]*14 for t in teams}
+        for _ in range(n_sim):
+            result = run_lottery_sim(teams)
+            for pick, name in result:
+                counts[name][pick-1] += 1
+        pcts = {}
+        for name, c in counts.items():
+            pcts[name] = [round(v / n_sim * 100, 1) for v in c]
+        return pcts
+
+    st.markdown("#### 2026 NBA Draft Lottery Simulator")
+
+    # Load lottery teams
+    if "lottery_teams_cache" not in st.session_state:
+        with st.spinner("Loading lottery teams..."):
+            try:
+                rows = get_full_standings()
+
+                # 2025-26 confirmed play-in losers (lost before reaching playoffs)
+                # West: Golden State Warriors, LA Clippers
+                # East: Miami Heat, Charlotte Hornets
+                PLAYIN_LOSERS_2026 = {
+                    "Golden State Warriors",
+                    "LA Clippers",
+                    "Miami Heat",
+                    "Charlotte Hornets",
+                }
+
+                # Lottery = teams with status "e" (non-play-in eliminated, seeds 11-15)
+                #         + the 4 confirmed play-in losers
+                lottery_pool = [
+                    r for r in rows
+                    if r.get("status") == "e" or r["name"] in PLAYIN_LOSERS_2026
+                ]
+
+                # Sort all 14 by worst record (fewest wins, then most losses)
+                lottery_pool.sort(key=lambda r: (r["w"], -r["l"]))
+                lottery_teams = lottery_pool[:14]
+                st.session_state["lottery_teams_cache"] = lottery_teams
+            except Exception:
+                st.session_state["lottery_teams_cache"] = []
+
+    lottery_teams = st.session_state["lottery_teams_cache"]
+
+    if not lottery_teams:
+        st.info("Could not load standings. Please check your NBA API connection.")
+    else:
+        n = len(lottery_teams)
+        odds_pcts = LOTTERY_PCT[:n]
+
+        # ── Team odds table (Tankathon style) ────────────────────────────────
+        st.markdown("**Lottery Odds — Worst Record First**")
+
+        rows_html = ""
+        for i, team in enumerate(lottery_teams):
+            pct   = odds_pcts[i] if i < len(odds_pcts) else 0
+            color = get_team_colors(team["name"])
+            primary = color["primary"]
+            bar_w = int(pct / 14.0 * 120)
+
+            # Traded pick info
+            trade_info = TRADED_PICKS.get(team["name"])
+            trade_html = ""
+            if trade_info:
+                trade_html = (
+                    f'<div style="font-size:10px;color:#d97706;margin-top:2px;">'
+                    f'{trade_info["note"]}</div>'
+                )
+
+            # Play-in badge
+            status_badge = (
+                '<span style="font-size:9px;padding:1px 5px;border-radius:3px;'
+                'background:#f59e0b;color:#fff;margin-left:6px;">Play-In</span>'
+                if team.get("status") == "pi" else ""
+            )
+            rows_html += (
+                f'<tr style="border-bottom:0.5px solid #f0f0f0;">'
+                f'<td style="padding:8px 10px;font-size:12px;color:#999;width:30px;">{i+1}</td>'
+                f'<td style="padding:8px 10px;">'
+                f'<span style="display:inline-block;width:4px;height:16px;border-radius:2px;'
+                f'background:{primary};margin-right:8px;vertical-align:middle;"></span>'
+                f'<span style="font-size:13px;font-weight:600;color:#111;">{team["name"]}</span>'
+                f'{status_badge}'
+                f'{trade_html}'
+                f'</td>'
+                f'<td style="padding:8px 10px;font-size:12px;color:#555;text-align:center;">'
+                f'{team["w"]}-{team["l"]}</td>'
+                f'<td style="padding:8px 14px;">'
+                f'<div style="display:flex;align-items:center;gap:8px;">'
+                f'<div style="width:{bar_w}px;height:10px;background:{primary};border-radius:3px;opacity:0.85;"></div>'
+                f'<span style="font-size:12px;font-weight:700;color:#111;">{pct}%</span>'
+                f'</div></td>'
+                f'</tr>'
+            )
+
+        st.markdown(
+            f'<div style="background:#fff;border:1px solid #e0e0e0;border-radius:10px;overflow:hidden;">'
+            f'<table style="width:100%;border-collapse:collapse;">'
+            f'<thead><tr style="background:#f8f9fa;border-bottom:2px solid #e0e0e0;">'
+            f'<th style="padding:8px 10px;font-size:10px;text-transform:uppercase;color:#888;font-weight:600;">#</th>'
+            f'<th style="padding:8px 10px;font-size:10px;text-transform:uppercase;color:#888;font-weight:600;">Team</th>'
+            f'<th style="padding:8px 10px;text-align:center;font-size:10px;text-transform:uppercase;color:#888;font-weight:600;">Record</th>'
+            f'<th style="padding:8px 14px;font-size:10px;text-transform:uppercase;color:#888;font-weight:600;">Odds (Pick #1)</th>'
+            f'</tr></thead><tbody>{rows_html}</tbody></table></div>',
+            unsafe_allow_html=True
+        )
+
+        # Traded picks note
+        active_trades = [(name, t) for name, t in TRADED_PICKS.items()
+                        if any(team["name"] == name for team in lottery_teams)]
+        if active_trades:
+            st.markdown(
+                '<p style="font-size:11px;color:#888;margin-top:8px;">'
+                + " &nbsp;|&nbsp; ".join(
+                    f'<span style="color:#d97706;font-weight:600;">{name.split()[-1]}</span>: {t["note"]}'
+                    for name, t in active_trades
+                )
+                + "</p>",
+                unsafe_allow_html=True
+            )
+        st.caption("Top 3 seeds share equal 14.0% odds per 2019 NBA lottery reform. Odds shown are for the #1 pick.")
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        # ── Odds matrix toggle ────────────────────────────────────────────────
+        if st.checkbox("Show full odds matrix (all pick positions)", key="show_matrix"):
+            if "odds_matrix" not in st.session_state:
+                with st.spinner("Computing odds matrix (50,000 simulations)..."):
+                    st.session_state["odds_matrix"] = compute_odds_matrix(lottery_teams)
+            matrix = st.session_state["odds_matrix"]
+
+            # Build matrix table
+            pick_headers = "".join(
+                f'<th style="padding:5px 4px;text-align:center;font-size:10px;'
+                f'color:#888;font-weight:600;min-width:38px;">#{p}</th>'
+                for p in range(1, n+1)
+            )
+            matrix_rows = ""
+            for i, team in enumerate(lottery_teams):
+                color   = get_team_colors(team["name"])
+                primary = color["primary"]
+                cells   = ""
+                row_pcts = matrix.get(team["name"], [0]*n)
+                for p_idx, pct_val in enumerate(row_pcts[:n]):
+                    # Color intensity by probability
+                    if pct_val == 0:
+                        cell_bg = "#f8f9fa"
+                        cell_fg = "#ccc"
+                    elif pct_val >= 20:
+                        cell_bg = primary
+                        cell_fg = "#fff"
+                    elif pct_val >= 10:
+                        cell_bg = color["pastel_bg"]
+                        cell_fg = color["on_bg"]
+                    else:
+                        cell_bg = "#f0f4ff"
+                        cell_fg = "#334155"
+                    cells += (
+                        f'<td style="padding:5px 4px;text-align:center;font-size:11px;'
+                        f'font-weight:{"700" if pct_val>=10 else "400"};'
+                        f'background:{cell_bg};color:{cell_fg};">'
+                        f'{"—" if pct_val==0 else f"{pct_val}%"}</td>'
+                    )
+                matrix_rows += (
+                    f'<tr style="border-bottom:0.5px solid #f0f0f0;">'
+                    f'<td style="padding:6px 10px;font-size:12px;font-weight:600;color:#111;white-space:nowrap;">'
+                    f'<span style="display:inline-block;width:3px;height:14px;border-radius:2px;'
+                    f'background:{primary};margin-right:7px;vertical-align:middle;"></span>'
+                    f'{team["name"]}</td>'
+                    f'{cells}</tr>'
+                )
+
+            st.markdown(
+                f'<div style="overflow-x:auto;background:#fff;border:1px solid #e0e0e0;border-radius:10px;">'
+                f'<table style="width:100%;border-collapse:collapse;">'
+                f'<thead><tr style="background:#f8f9fa;border-bottom:2px solid #e0e0e0;">'
+                f'<th style="padding:6px 10px;font-size:10px;color:#888;font-weight:600;text-align:left;">Team</th>'
+                f'{pick_headers}</tr></thead>'
+                f'<tbody>{matrix_rows}</tbody></table></div>',
+                unsafe_allow_html=True
+            )
+            st.caption("Probabilities computed via 50,000 Monte Carlo simulations.")
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        # ── Simulation ───────────────────────────────────────────────────────
+        sim_col1, sim_col2 = st.columns([1, 3])
+        with sim_col1:
+            run_sim = st.button("Run Lottery", key="btn_lottery", use_container_width=True)
+        with sim_col2:
+            if "lottery_result" in st.session_state:
+                st.caption("Showing last simulation result. Click Run Lottery to re-simulate.")
+
+        if run_sim:
+            result = run_lottery_sim(lottery_teams)
+            st.session_state["lottery_result"] = result
+            # Clear matrix cache so it can be regenerated if needed
+            if "odds_matrix" in st.session_state:
+                del st.session_state["odds_matrix"]
+
+        if "lottery_result" in st.session_state:
+            result = st.session_state["lottery_result"]
+
+            # Determine which teams "jumped" above their seed
+            name_to_seed = {t["name"]: i+1 for i, t in enumerate(lottery_teams)}
+
+            st.markdown("### Results")
+
+            # Reveal picks 1 → 14
+            reveal_html = ""
+            for pick, team_name in result:
+                seed       = name_to_seed.get(team_name, pick)
+                jumped     = pick < seed
+                stayed     = pick == seed
+                fell       = pick > seed
+                color      = get_team_colors(team_name)
+                primary    = color["primary"]
+                on_bg      = color["on_bg"]
+                logo_url   = get_team_logo_url(team_name)
+
+                # Traded pick: determine actual pick recipient
+                trade     = TRADED_PICKS.get(team_name)
+                pick_owner = team_name
+                owner_note = ""
+                if trade:
+                    protected = trade.get("protected")
+                    if protected is None:
+                        # Always conveys
+                        pick_owner = trade["owner"]
+                        owner_note = f'<span style="font-size:10px;color:#d97706;font-weight:600;margin-left:6px;">→ {trade["owner"]}</span>'
+                    elif pick > protected:
+                        # Outside protection range — pick conveys
+                        pick_owner = trade["owner"]
+                        owner_note = f'<span style="font-size:10px;color:#d97706;font-weight:600;margin-left:6px;">→ {trade["owner"]}</span>'
+                    else:
+                        # Inside protection — team keeps it
+                        owner_note = f'<span style="font-size:10px;color:#16a34a;margin-left:6px;">Protected — stays with {team_name}</span>'
+
+                # Jump indicator
+                if jumped:
+                    jump_str = f'<span style="color:#16a34a;font-size:11px;font-weight:700;">▲ {seed - pick} jump</span>'
+                elif fell:
+                    jump_str = f'<span style="color:#dc2626;font-size:11px;font-weight:700;">▼ {pick - seed} fall</span>'
+                else:
+                    jump_str = f'<span style="color:#888;font-size:11px;">stayed at #{seed}</span>'
+
+                is_top4   = pick <= 4
+                pick_size = "22px" if is_top4 else "16px"
+                row_bg    = color["pastel_bg"] if is_top4 else "#fafafa"
+                border_l  = f'border-left:4px solid {primary};' if is_top4 else 'border-left:4px solid #e0e0e0;'
+
+                logo_html = (
+                    f'<img src="{logo_url}" style="width:32px;height:32px;object-fit:contain;" '
+                    f'onerror="this.style.display=\'none\'">'
+                    if logo_url else
+                    f'<div style="width:32px;height:32px;border-radius:50%;background:{primary};"></div>'
+                )
+
+                reveal_html += (
+                    f'<div style="display:flex;align-items:center;gap:14px;'
+                    f'padding:12px 16px;{border_l}background:{row_bg};'
+                    f'border-bottom:1px solid #f0f0f0;">'
+                    f'<div style="font-size:{pick_size};font-weight:800;color:{"#111" if is_top4 else "#999"};'
+                    f'min-width:40px;text-align:center;">#{pick}</div>'
+                    f'{logo_html}'
+                    f'<div style="flex:1;">'
+                    f'<div style="font-size:{"15px" if is_top4 else "13px"};font-weight:{"700" if is_top4 else "500"};color:#111;">'
+                    f'{team_name}{owner_note}'
+                    + (f' <span style="font-size:10px;font-weight:700;padding:2px 7px;border-radius:99px;'
+                       f'background:{primary};color:{on_bg};">LOTTERY PICK</span>' if is_top4 else "")
+                    + f'</div>'
+                    f'<div style="font-size:11px;color:#555;margin-top:2px;">'
+                    f'Seed #{seed} · {jump_str}</div>'
+                    f'</div>'
+                    f'<div style="text-align:right;font-size:11px;color:#888;">'
+                    f'Odds: {odds_pcts[seed-1] if seed-1<len(odds_pcts) else 0}%</div>'
+                    f'</div>'
+                )
+
+            st.markdown(
+                f'<div style="background:#fff;border:1px solid #e0e0e0;border-radius:12px;overflow:hidden;">'
+                f'{reveal_html}</div>',
+                unsafe_allow_html=True
+            )
+
+            # Summary stats
+            top4 = [(pick, name) for pick, name in result if pick <= 4]
+            jumped_teams = [(pick, name) for pick, name in top4
+                           if pick < name_to_seed.get(name, pick)]
+            if jumped_teams:
+                st.markdown(
+                    "**Lottery jumps:** " +
+                    ", ".join(f"{name} (#{pick})" for pick, name in jumped_teams)
+                )
+            st.caption("Picks 1-4 are not determined by weighted lottery draw. Picks 5-14 follow reverse standings order.")
+
+
+
+
+# ---------------------------------------------------------------------------
+# Tab 6 — Compare Players
 # ---------------------------------------------------------------------------
 
 with tab_player_cmp:
@@ -1352,7 +2292,7 @@ with tab_player_cmp:
 
 
 # ---------------------------------------------------------------------------
-# Tab 4 — Compare Teams
+# Tab 7 — Compare Teams
 # ---------------------------------------------------------------------------
 
 with tab_team_cmp:

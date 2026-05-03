@@ -12,6 +12,9 @@ from nba_api.stats.endpoints import (
     teamyearbyyearstats,
     playercareerstats,
     leaguestandingsv3,
+    teamgamelog,
+    boxscoresummaryv2,
+    scoreboardv2,
 )
 from nba_api.stats.static import players as nba_static_players
 from nba_api.stats.static import teams as nba_static_teams
@@ -40,8 +43,13 @@ def _nba_call(fn, retries=3, delay=5):
 
 
 def _normalize(text):
-    """Strip accents for fuzzy name matching."""
-    return unicodedata.normalize("NFD", text).encode("ascii", "ignore").decode("ascii").lower()
+    """Strip accents, hyphens, and punctuation for fuzzy name matching."""
+    import re
+    t = unicodedata.normalize("NFD", str(text)).encode("ascii", "ignore").decode("ascii").lower()
+    t = re.sub(r"[-'.]", " ", t)          # hyphen/apostrophe → space
+    t = re.sub(r"[^a-z0-9 ]", "", t)     # strip remaining punctuation
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
 
 
 def _get_player_id(player_name):
@@ -1143,21 +1151,40 @@ LEGENDS = [
 
 
 def _get_player_id_all(player_name):
-    """Look up player ID including retired players."""
+    """Look up player ID including retired players. Uses progressive matching."""
     from nba_api.stats.static import players as nba_players
     norm = _normalize(player_name)
-    # Check active first
-    for p in nba_players.get_active_players():
+
+    all_players = nba_players.get_players()
+
+    # 1. Exact normalized match
+    for p in all_players:
         if _normalize(p["full_name"]) == norm:
             return p["id"]
-    # Then retired
-    for p in nba_players.get_players():
-        if _normalize(p["full_name"]) == norm:
+
+    # 2. Partial normalized match (name contains search or vice versa)
+    for p in all_players:
+        pn = _normalize(p["full_name"])
+        if norm in pn or pn in norm:
             return p["id"]
-    # Partial match
-    for p in nba_players.get_players():
-        if norm in _normalize(p["full_name"]):
+
+    # 3. Last name only match (e.g. "Abdul-Jabbar" → "Kareem Abdul-Jabbar")
+    norm_parts = norm.split()
+    if len(norm_parts) >= 2:
+        last = norm_parts[-1]
+        first = norm_parts[0]
+        for p in all_players:
+            pn = _normalize(p["full_name"])
+            pn_parts = pn.split()
+            if len(pn_parts) >= 2 and pn_parts[0] == first and pn_parts[-1] == last:
+                return p["id"]
+
+    # 4. All words in search appear somewhere in the player name
+    for p in all_players:
+        pn = _normalize(p["full_name"])
+        if all(part in pn for part in norm_parts if len(part) > 2):
             return p["id"]
+
     return None
 
 
@@ -1678,3 +1705,930 @@ def get_league_standings():
 
     _STANDINGS_CACHE = result
     return result
+
+
+# ── Team schedule ─────────────────────────────────────────────────────────────
+
+def _parse_nba_date(raw):
+    """Convert NBA API date formats to YYYY-MM-DD string."""
+    raw = str(raw).strip()
+    if not raw:
+        return ""
+    # ISO format already: "2025-10-22"
+    if len(raw) >= 10 and raw[4] == "-":
+        return raw[:10]
+    # NBA API format: "OCT 22, 2025"
+    from datetime import datetime
+    for fmt in ("%b %d, %Y", "%B %d, %Y", "%b %d %Y"):
+        try:
+            return datetime.strptime(raw, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    # Fallback — return as-is
+    return raw
+
+
+def get_team_schedule(team_name, season=None):
+    """
+    Return full season schedule for a team (regular season + playoffs).
+    Each game includes cumulative W-L record after that game.
+    """
+    season = season or CURRENT_SEASON
+    team_id = _get_team_id(team_name)
+    if not team_id:
+        return {"error": f"Team not found: {team_name}"}
+
+    try:
+        df = _nba_call(lambda: teamgamelog.TeamGameLog(
+            team_id=team_id,
+            season=season,
+            season_type_all_star="Regular Season",
+            timeout=NBA_TIMEOUT,
+        ).get_data_frames()[0])
+
+        games = []
+        if df is not None and not df.empty:
+            # API returns most-recent first — reverse to chronological
+            for _, row in df.iloc[::-1].iterrows():
+                matchup = row.get("MATCHUP", "")
+                is_home = "vs." in matchup
+                opp     = matchup.split("vs.")[-1].strip() if is_home \
+                          else matchup.split("@")[-1].strip()
+                games.append({
+                    "date":     _parse_nba_date(row.get("GAME_DATE", "")),
+                    "home":     is_home,
+                    "opponent": opp,
+                    "result":   row.get("WL", ""),
+                    "pts":      int(row["PTS"]) if "PTS" in row.index else None,
+                    "matchup":  matchup,
+                    "game_id":  str(row.get("Game_ID", "")),
+                    "w":        int(row.get("W", 0)) if "W" in row.index else None,
+                    "l":        int(row.get("L", 0)) if "L" in row.index else None,
+                })
+
+        # Try playoffs
+        try:
+            po_df = _nba_call(lambda: teamgamelog.TeamGameLog(
+                team_id=team_id,
+                season=season,
+                season_type_all_star="Playoffs",
+                timeout=NBA_TIMEOUT,
+            ).get_data_frames()[0])
+            if po_df is not None and not po_df.empty:
+                for _, row in po_df.iloc[::-1].iterrows():
+                    matchup = row.get("MATCHUP", "")
+                    is_home = "vs." in matchup
+                    opp     = matchup.split("vs.")[-1].strip() if is_home \
+                              else matchup.split("@")[-1].strip()
+                    games.append({
+                        "date":     _parse_nba_date(row.get("GAME_DATE", "")),
+                        "home":     is_home,
+                        "opponent": opp,
+                        "result":   row.get("WL", ""),
+                        "pts":      int(row["PTS"]) if "PTS" in row.index else None,
+                        "matchup":  matchup,
+                        "game_id":  str(row.get("Game_ID", "")),
+                        "playoffs": True,
+                        "w":        int(row.get("W", 0)) if "W" in row.index else None,
+                        "l":        int(row.get("L", 0)) if "L" in row.index else None,
+                    })
+        except Exception:
+            pass
+
+        games.sort(key=lambda g: g["date"])
+
+        # Build cumulative record if W/L columns not in API response
+        # (some API versions omit them in game log)
+        cw = cl = 0
+        for g in games:
+            if g.get("w") is not None and not g.get("playoffs"):
+                cw = g["w"]
+                cl = g["l"]
+            elif g.get("result") and not g.get("playoffs"):
+                if g["result"] == "W":
+                    cw += 1
+                elif g["result"] == "L":
+                    cl += 1
+            g["cum_w"] = cw
+            g["cum_l"] = cl
+
+        return games
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ── Box score game search ─────────────────────────────────────────────────────
+
+def detect_season_type(date=None):
+    """
+    Determine NBA season type for a given date based on 2025-26 schedule:
+    - Regular Season: Oct 21 2025 – Apr 12 2026
+    - Play In:        Apr 14–17 2026
+    - Playoffs:       Apr 18 2026 – Jun 19 2026
+    Returns "Regular Season", "PlayIn", or "Playoffs"
+    """
+    from datetime import date as _date
+    if date is None:
+        date = _date.today()
+    if isinstance(date, str):
+        from datetime import datetime
+        date = datetime.strptime(date, "%Y-%m-%d").date()
+
+    if date >= _date(2026, 4, 18):
+        return "Playoffs"
+    if date >= _date(2026, 4, 14):
+        return "PlayIn"
+    if date >= _date(2025, 10, 21):
+        return "Regular Season"
+    return "Regular Season"
+
+
+def get_todays_games(date_str=None):
+    """
+    Fetch today's games using NBA Live API (nba_api.live).
+    This only returns real confirmed games — no ghost/placeholder series games.
+    Falls back to scoreboardv2 and then leaguegamefinder.
+    """
+    from datetime import date as _date, datetime
+    if date_str is None:
+        date_str = _date.today().strftime("%Y-%m-%d")
+
+    # ── Try NBA Live Scoreboard (most accurate, real-time) ────────────────
+    try:
+        from nba_api.live.nba.endpoints import scoreboard as live_sb
+        board     = live_sb.ScoreBoard()
+        data      = board.get_dict()
+        games_raw = data.get("scoreboard", {}).get("games", [])
+        results = []
+        for g in games_raw:
+            gid        = str(g.get("gameId", ""))
+            status_val = int(g.get("gameStatus", 1))   # 1=pre 2=live 3=final
+            status_txt = g.get("gameStatusText", "").strip()
+            home       = g.get("homeTeam", {})
+            away       = g.get("awayTeam", {})
+
+            home_pts = home.get("score")
+            away_pts = away.get("score")
+            if home_pts is not None:
+                try: home_pts = int(home_pts)
+                except: home_pts = None
+            if away_pts is not None:
+                try: away_pts = int(away_pts)
+                except: away_pts = None
+
+            home_city  = home.get("teamCity", "")
+            home_name  = home.get("teamName", "")
+            away_city  = away.get("teamCity", "")
+            away_name  = away.get("teamName", "")
+
+            # Live period/clock info
+            period = g.get("period", 0)
+            clock  = g.get("gameClock", "")
+            if status_val == 2 and period:
+                # Format: "PT05M30.00S" → "Q3 5:30"
+                try:
+                    mins = int(float(clock.replace("PT","").replace("M",":").split(":")[0])) if clock else 0
+                    secs = int(float(clock.split("M")[-1].replace("S",""))) if "M" in clock else 0
+                    live_txt = f"Q{period} {mins}:{secs:02d}"
+                except Exception:
+                    live_txt = f"Q{period}"
+            else:
+                live_txt = status_txt
+
+            # Series info from live API
+            home_sw = int(home.get("wins", 0) or 0)
+            away_sw = int(away.get("wins", 0) or 0)
+            series_text = g.get("seriesText", "")
+
+            results.append({
+                "game_id":         gid,
+                "date":            date_str,
+                "status_id":       status_val,
+                "status_txt":      live_txt,
+                "is_live":         status_val == 2,
+                "is_final":        status_val == 3,
+                "home_abbr":       home.get("teamTricode", ""),
+                "home_name":       f"{home_city} {home_name}".strip(),
+                "home_pts":        home_pts,
+                "away_abbr":       away.get("teamTricode", ""),
+                "away_name":       f"{away_city} {away_name}".strip(),
+                "away_pts":        away_pts,
+                "finished":        status_val == 3,
+                "home_series_wins":home_sw,
+                "away_series_wins":away_sw,
+                "series_text":     series_text,
+            })
+        if results:
+            return results
+    except Exception:
+        pass
+
+    # ── Fallback: scoreboardv2 ─────────────────────────────────────────────
+    try:
+        dt      = datetime.strptime(date_str, "%Y-%m-%d")
+        sb_date = dt.strftime("%m/%d/%Y")
+        sb = _nba_call(lambda: scoreboardv2.ScoreboardV2(
+            game_date=sb_date, league_id="00", day_offset=0, timeout=NBA_TIMEOUT,
+        ).get_data_frames())
+
+        if sb is not None and len(sb) >= 2:
+            game_header = sb[0]
+            line_score  = sb[1]
+            results = []
+            for _, gh in game_header.iterrows():
+                gid        = str(gh.get("GAME_ID", ""))
+                status_val = int(gh.get("GAME_STATUS_ID", 1))
+                status_txt = str(gh.get("GAME_STATUS_TEXT", "")).strip()
+                home_tid   = gh.get("HOME_TEAM_ID")
+                away_tid   = gh.get("VISITOR_TEAM_ID")
+
+                home_row = line_score[line_score["TEAM_ID"] == home_tid]
+                away_row = line_score[line_score["TEAM_ID"] == away_tid]
+
+                def safe_name(row):
+                    if row.empty: return ""
+                    city = str(row["TEAM_CITY_NAME"].iloc[0]) if "TEAM_CITY_NAME" in row.columns else ""
+                    name = str(row["TEAM_NAME"].iloc[0])      if "TEAM_NAME"      in row.columns else ""
+                    return f"{city} {name}".strip()
+
+                def safe_pts(row):
+                    if row.empty or "PTS" not in row.columns: return None
+                    v = row["PTS"].iloc[0]
+                    return int(v) if v == v else None
+
+                # Only include games that are live, final, or have confirmed time
+                txt_up = status_txt.upper()
+                if status_val in (2, 3) or any(x in txt_up for x in ["PM", "AM", "ET", ":"]):
+                    results.append({
+                        "game_id":    gid,
+                        "date":       date_str,
+                        "status_id":  status_val,
+                        "status_txt": status_txt,
+                        "is_live":    status_val == 2,
+                        "is_final":   status_val == 3,
+                        "home_abbr":  home_row["TEAM_ABBREVIATION"].iloc[0] if not home_row.empty else "",
+                        "home_name":  safe_name(home_row),
+                        "home_pts":   safe_pts(home_row),
+                        "away_abbr":  away_row["TEAM_ABBREVIATION"].iloc[0] if not away_row.empty else "",
+                        "away_name":  safe_name(away_row),
+                        "away_pts":   safe_pts(away_row),
+                        "finished":   status_val == 3,
+                    })
+            if results:
+                return results
+    except Exception:
+        pass
+
+    # ── Final fallback: leaguegamefinder (completed games only) ───────────
+    stype = detect_season_type(date_str)
+    return get_games_on_date(date_str, CURRENT_SEASON, stype)
+
+
+def get_games_on_date(date_str, season=None, season_type="Regular Season"):
+    """
+    Return all games on a specific date — past, present, or future.
+    Includes series wins for playoff games.
+    """
+    season   = season or CURRENT_SEASON
+    from datetime import date as _date, datetime as _datetime
+    try:
+        req_date = _datetime.strptime(date_str, "%Y-%m-%d").date()
+        is_future = req_date > _date.today()
+    except Exception:
+        is_future = False
+
+    # ── For future or today: try scoreboardv2 first ───────────────────────
+    if is_future or req_date == _date.today():
+        try:
+            dt      = _datetime.strptime(date_str, "%Y-%m-%d")
+            sb_date = dt.strftime("%m/%d/%Y")
+            sb = _nba_call(lambda: scoreboardv2.ScoreboardV2(
+                game_date=sb_date, league_id="00", day_offset=0, timeout=NBA_TIMEOUT,
+            ).get_data_frames())
+
+            if sb is not None and len(sb) >= 2:
+                game_header = sb[0]
+                line_score  = sb[1]
+                results = []
+                for _, gh in game_header.iterrows():
+                    gid        = str(gh.get("GAME_ID", ""))
+                    status_val = int(gh.get("GAME_STATUS_ID", 1))
+                    status_txt = str(gh.get("GAME_STATUS_TEXT", "")).strip()
+                    home_tid   = gh.get("HOME_TEAM_ID")
+                    away_tid   = gh.get("VISITOR_TEAM_ID")
+
+                    home_row = line_score[line_score["TEAM_ID"] == home_tid]
+                    away_row = line_score[line_score["TEAM_ID"] == away_tid]
+
+                    def sn(row):
+                        if row.empty: return ""
+                        city = str(row["TEAM_CITY_NAME"].iloc[0]) if "TEAM_CITY_NAME" in row.columns else ""
+                        name = str(row["TEAM_NAME"].iloc[0])      if "TEAM_NAME"      in row.columns else ""
+                        return f"{city} {name}".strip()
+
+                    def sp(row):
+                        if row.empty or "PTS" not in row.columns: return None
+                        v = row["PTS"].iloc[0]
+                        return int(v) if v == v else None
+
+                    txt_up = status_txt.upper()
+                    # Skip TBD placeholders for ended series
+                    if status_val not in (2, 3) and not any(x in txt_up for x in ["PM", "AM", "ET", ":"]):
+                        continue
+
+                    results.append({
+                        "game_id":         gid,
+                        "date":            date_str,
+                        "status_id":       status_val,
+                        "status_txt":      status_txt,
+                        "is_live":         status_val == 2,
+                        "is_final":        status_val == 3,
+                        "home_abbr":       home_row["TEAM_ABBREVIATION"].iloc[0] if not home_row.empty else "",
+                        "home_name":       sn(home_row),
+                        "home_pts":        sp(home_row),
+                        "away_abbr":       away_row["TEAM_ABBREVIATION"].iloc[0] if not away_row.empty else "",
+                        "away_name":       sn(away_row),
+                        "away_pts":        sp(away_row),
+                        "finished":        status_val == 3,
+                        "home_series_wins":0,
+                        "away_series_wins":0,
+                        "series_text":     "",
+                    })
+                if results:
+                    return results
+        except Exception:
+            pass
+
+    # ── For past games: leaguegamefinder ─────────────────────────────────
+    try:
+        df = _nba_call(lambda: leaguegamefinder.LeagueGameFinder(
+            date_from_nullable=date_str,
+            date_to_nullable=date_str,
+            season_nullable=season,
+            season_type_nullable=season_type,
+            league_id_nullable="00",
+            timeout=NBA_TIMEOUT,
+        ).get_data_frames()[0])
+
+        if df is None or df.empty:
+            return []
+
+        # Build series win counts from the full season playoff log
+        series_wins = {}  # game_id -> {home_abbr: wins, away_abbr: wins}
+        if season_type == "Playoffs":
+            try:
+                # Get all playoff games this season to compute series records
+                po_df = _nba_call(lambda: leaguegamefinder.LeagueGameFinder(
+                    season_nullable=season,
+                    season_type_nullable="Playoffs",
+                    league_id_nullable="00",
+                    timeout=NBA_TIMEOUT,
+                ).get_data_frames()[0])
+
+                if po_df is not None and not po_df.empty:
+                    # Group by matchup pairs and compute running series wins
+                    po_df = po_df.sort_values("GAME_DATE")
+                    # Build dict: (team_a, team_b) -> {wins_a, wins_b}
+                    pair_wins = {}
+                    for _, row in po_df.iterrows():
+                        matchup = str(row.get("MATCHUP", ""))
+                        t_abbr  = row.get("TEAM_ABBREVIATION", "")
+                        gid     = str(row.get("GAME_ID", ""))
+                        wl      = row.get("WL", "")
+                        is_home = "vs." in matchup
+                        opp_abbr = matchup.split("vs.")[-1].strip() if is_home else matchup.split("@")[-1].strip()
+
+                        key = tuple(sorted([t_abbr, opp_abbr]))
+                        if key not in pair_wins:
+                            pair_wins[key] = {key[0]: 0, key[1]: 0}
+                        if wl == "W":
+                            pair_wins[key][t_abbr] = pair_wins[key].get(t_abbr, 0) + 1
+
+                        series_wins[gid] = dict(pair_wins[key])
+            except Exception:
+                pass
+
+        # Build game list
+        games = {}
+        for _, row in df.iterrows():
+            gid     = str(row.get("GAME_ID", ""))
+            matchup = row.get("MATCHUP", "")
+            t_abbr  = row.get("TEAM_ABBREVIATION", "")
+            is_home = "vs." in matchup
+            opp_abbr = matchup.split("vs.")[-1].strip() if is_home \
+                       else matchup.split("@")[-1].strip()
+
+            if gid not in games:
+                games[gid] = {
+                    "game_id":   gid,
+                    "date":      date_str,
+                    "home_abbr": "", "home_name": "", "home_pts": None,
+                    "away_abbr": "", "away_name": "", "away_pts": None,
+                    "status_id": 3, "status_txt": "Final",
+                    "is_live": False, "is_final": True, "finished": True,
+                    "home_series_wins": 0, "away_series_wins": 0,
+                    "series_text": "",
+                }
+
+            pts = int(row["PTS"]) if "PTS" in row.index and row["PTS"] == row["PTS"] else None
+            team_name = row.get("TEAM_NAME", t_abbr)
+
+            if is_home:
+                games[gid]["home_abbr"] = t_abbr
+                games[gid]["home_name"] = team_name
+                games[gid]["home_pts"]  = pts
+            else:
+                games[gid]["away_abbr"] = t_abbr
+                games[gid]["away_name"] = team_name
+                games[gid]["away_pts"]  = pts
+
+            # Attach series wins
+            if gid in series_wins:
+                sw = series_wins[gid]
+                home_a = games[gid]["home_abbr"]
+                away_a = games[gid]["away_abbr"]
+                games[gid]["home_series_wins"] = sw.get(home_a, 0)
+                games[gid]["away_series_wins"] = sw.get(away_a, 0)
+
+        result = [g for g in games.values() if g["home_abbr"] and g["away_abbr"]]
+        return sorted(result, key=lambda g: g.get("away_name", ""))
+    except Exception:
+        return []
+
+
+def _get_series_info(home_abbr, away_abbr, game_date, season=None, season_type="Playoffs"):
+    """Compute series wins and seedings for a playoff game."""
+    season = season or CURRENT_SEASON
+    info = {"home_wins": 0, "away_wins": 0, "game_number": 0,
+            "home_seed": None, "away_seed": None}
+
+    if season_type != "Playoffs":
+        return info
+
+    # Quick seeding lookup from static standings cache
+    try:
+        rows = get_full_standings()
+        for r in rows:
+            if r["abbr"].upper() == home_abbr.upper().strip():
+                info["home_seed"] = r.get("conf_rank")
+            if r["abbr"].upper() == away_abbr.upper().strip():
+                info["away_seed"] = r.get("conf_rank")
+    except Exception:
+        pass
+
+    # Series game log — only if we have a valid date
+    if not game_date:
+        return info
+
+    try:
+        home_full = next((t["full_name"] for t in nba_static_teams.get_teams()
+                         if t["abbreviation"].upper() == home_abbr.upper().strip()), None)
+        if not home_full:
+            return info
+        home_id = _get_team_id(home_full)
+        if not home_id:
+            return info
+
+        df = _nba_call(lambda: leaguegamefinder.LeagueGameFinder(
+            team_id_nullable=home_id,
+            season_nullable=season,
+            season_type_nullable="Playoffs",
+            timeout=15,   # short timeout so it doesn't stall UI
+        ).get_data_frames()[0])
+
+        if df is None or df.empty:
+            return info
+
+        # Filter to games vs the away team by abbreviation in matchup
+        series_df = df[df["MATCHUP"].str.contains(away_abbr.strip(), case=False, na=False)]
+        if series_df.empty:
+            return info
+
+        series_df = series_df.sort_values("GAME_DATE", ascending=True)
+        games_up_to = series_df[series_df["GAME_DATE"] <= game_date]
+        info["game_number"] = len(games_up_to)
+        info["home_wins"]   = int((games_up_to["WL"] == "W").sum())
+        info["away_wins"]   = int((games_up_to["WL"] == "L").sum())
+    except Exception:
+        pass
+
+    return info
+
+
+def get_boxscore_by_game_id(game_id, season_type="Regular Season", season=None):
+    """Fetch full box score directly from a game_id, with series info and seedings."""
+    season = season or CURRENT_SEASON
+    try:
+        bs = _nba_call(lambda: boxscoretraditionalv2.BoxScoreTraditionalV2(
+            game_id=game_id, timeout=NBA_TIMEOUT
+        ).get_data_frames())
+
+        if bs is None:
+            return {"error": "Box score unavailable"}
+
+        players_df = bs[0]
+        summary_df = bs[5] if len(bs) > 5 else None
+
+        arena = attendance = date_str = ""
+        if summary_df is not None and not summary_df.empty:
+            s = summary_df.iloc[0]
+            arena      = str(s.get("ARENA_NAME", ""))
+            attendance = str(s.get("ATTENDANCE", ""))
+            date_str   = _parse_nba_date(str(s.get("GAME_DATE_EST", "")))
+
+        teams_out = {}
+        abbr_list = []
+        for team_abbr, grp in players_df.groupby("TEAM_ABBREVIATION"):
+            abbr_list.append(team_abbr)
+            grp = grp.sort_values("PTS", ascending=False)
+            player_rows = []
+            for _, p in grp.iterrows():
+                if p.get("MIN") and str(p["MIN"]) not in ("None", "nan", ""):
+                    player_rows.append({
+                        "name":       p["PLAYER_NAME"],
+                        "min":        str(p["MIN"])[:5],
+                        "pts":        int(p["PTS"])       if p["PTS"]   == p["PTS"] else 0,
+                        "reb":        int(p["REB"])       if p["REB"]   == p["REB"] else 0,
+                        "ast":        int(p["AST"])       if p["AST"]   == p["AST"] else 0,
+                        "stl":        int(p["STL"])       if p["STL"]   == p["STL"] else 0,
+                        "blk":        int(p["BLK"])       if p["BLK"]   == p["BLK"] else 0,
+                        "tov":        int(p["TO"])        if "TO" in p.index and p["TO"] == p["TO"] else 0,
+                        "fg":         f"{int(p['FGM']) if p['FGM']==p['FGM'] else 0}-{int(p['FGA']) if p['FGA']==p['FGA'] else 0}",
+                        "fg3":        f"{int(p['FG3M']) if p['FG3M']==p['FG3M'] else 0}-{int(p['FG3A']) if p['FG3A']==p['FG3A'] else 0}",
+                        "ft":         f"{int(p['FTM']) if p['FTM']==p['FTM'] else 0}-{int(p['FTA']) if p['FTA']==p['FTA'] else 0}",
+                        "plus_minus": int(p["PLUS_MINUS"]) if "PLUS_MINUS" in p.index and p["PLUS_MINUS"] == p["PLUS_MINUS"] else 0,
+                    })
+            teams_out[team_abbr] = {
+                "players":   player_rows,
+                "total_pts": sum(r["pts"] for r in player_rows),
+            }
+
+        away_abbr = abbr_list[0] if abbr_list else ""
+        home_abbr = abbr_list[1] if len(abbr_list) > 1 else ""
+
+        # Series info + seedings (for playoff games)
+        series = _get_series_info(home_abbr, away_abbr, date_str, season, season_type)
+
+        return {
+            "game_id":          game_id,
+            "date":             date_str,
+            "matchup":          f"{away_abbr} @ {home_abbr}",
+            "season":           season,
+            "season_type":      season_type,
+            "arena":            arena,
+            "attendance":       attendance,
+            "home_abbr":        home_abbr,
+            "away_abbr":        away_abbr,
+            "series_home_wins": series["home_wins"],
+            "series_away_wins": series["away_wins"],
+            "game_number":      series["game_number"],
+            "home_seed":        series["home_seed"],
+            "away_seed":        series["away_seed"],
+            "teams":            teams_out,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def search_game_boxscore(team1_name, team2_name=None, date=None, season=None,
+                         game_number=None, season_type="Regular Season"):
+    """
+    Find a specific game and return full box score for both teams.
+    Searches by team + optional date or game number in a series.
+    """
+    season = season or CURRENT_SEASON
+    team_id = _get_team_id(team1_name) if team1_name else None
+
+    try:
+        params = dict(
+            season_nullable=season,
+            league_id_nullable="00",
+            season_type_nullable=season_type,
+            timeout=NBA_TIMEOUT,
+        )
+        if team_id:
+            params["team_id_nullable"] = team_id
+
+        df = _nba_call(lambda: leaguegamefinder.LeagueGameFinder(**params)
+                       .get_data_frames()[0])
+
+        if df is None or df.empty:
+            return {"error": "No games found"}
+
+        # Filter by second team if provided
+        if team2_name:
+            t2_norm = _normalize(team2_name)
+            df = df[df["MATCHUP"].apply(
+                lambda m: t2_norm in _normalize(str(m))
+            )]
+
+        # Filter by date
+        if date:
+            df = df[df["GAME_DATE"].str.contains(date, na=False)]
+
+        if df.empty:
+            return {"error": "No matching game found"}
+
+        # Sort by date desc, take first match (or nth for game_number)
+        df = df.sort_values("GAME_DATE", ascending=False)
+        if game_number and game_number > 1:
+            # For playoff series — game N means the Nth game between these teams
+            df = df.head(game_number)
+            row = df.iloc[-1]
+        else:
+            row = df.iloc[0]
+
+        game_id = str(row.get("GAME_ID", ""))
+        if not game_id:
+            return {"error": "Game ID not found"}
+
+        # Fetch full box score
+        bs = _nba_call(lambda: boxscoretraditionalv2.BoxScoreTraditionalV2(
+            game_id=game_id, timeout=NBA_TIMEOUT
+        ).get_data_frames())
+
+        if bs is None:
+            return {"error": "Box score unavailable"}
+
+        players_df = bs[0]
+        summary_df = bs[5] if len(bs) > 5 else None
+
+        # Determine home/away from matchup string
+        matchup_str = str(row.get("MATCHUP", ""))
+        if " vs. " in matchup_str:
+            home_abbr = row.get("TEAM_ABBREVIATION", "")
+            away_abbr = matchup_str.split("vs.")[-1].strip()
+        else:
+            away_abbr = row.get("TEAM_ABBREVIATION", "")
+            home_abbr = matchup_str.split("@")[-1].strip()
+
+        # Series info for playoffs: count wins each team has in the series
+        series_home_wins = series_away_wins = 0
+        game_number_in_series = 1
+        if season_type == "Playoffs":
+            try:
+                # Get all games between these two teams this season
+                series_df = _nba_call(lambda: leaguegamefinder.LeagueGameFinder(
+                    team_id_nullable=_get_team_id(team1_name),
+                    season_nullable=season,
+                    season_type_nullable="Playoffs",
+                    timeout=NBA_TIMEOUT,
+                ).get_data_frames()[0])
+                if series_df is not None and not series_df.empty and team2_name:
+                    t2_norm = _normalize(team2_name)
+                    series_df = series_df[series_df["MATCHUP"].apply(
+                        lambda m: t2_norm in _normalize(str(m))
+                    )]
+                    # Sort chronologically
+                    series_df = series_df.sort_values("GAME_DATE", ascending=True)
+                    # Find where this game falls
+                    game_date_str = str(row.get("GAME_DATE", ""))
+                    games_up_to = series_df[series_df["GAME_DATE"] <= game_date_str]
+                    game_number_in_series = len(games_up_to)
+                    # Wins before this game
+                    for _, sg in games_up_to.iterrows():
+                        wl      = sg.get("WL", "")
+                        t_abbr  = sg.get("TEAM_ABBREVIATION", "")
+                        matchup = sg.get("MATCHUP", "")
+                        is_home = "vs." in matchup
+                        if wl == "W":
+                            if is_home:
+                                series_home_wins += 1
+                            else:
+                                series_away_wins += 1
+                        elif wl == "L":
+                            if is_home:
+                                series_away_wins += 1
+                            else:
+                                series_home_wins += 1
+                        break  # Only need per-game from team1's perspective, deduplicate
+                    # Simpler: just count W/L from team1's side
+                    series_home_wins = 0
+                    series_away_wins = 0
+                    for _, sg in games_up_to.iterrows():
+                        wl     = sg.get("WL", "")
+                        is_home_row = "vs." in sg.get("MATCHUP", "")
+                        # team1 is away here since we searched with team1
+                        if wl == "W":
+                            series_away_wins += 1
+                        else:
+                            series_home_wins += 1
+            except Exception:
+                pass
+
+        # Build team box scores
+        teams_out = {}
+        for team_abbr, grp in players_df.groupby("TEAM_ABBREVIATION"):
+            grp = grp.sort_values("PTS", ascending=False)
+            player_rows = []
+            for _, p in grp.iterrows():
+                if p.get("MIN") and str(p["MIN"]) not in ("None", "nan", ""):
+                    player_rows.append({
+                        "name":        p["PLAYER_NAME"],
+                        "min":         str(p["MIN"])[:5],
+                        "pts":         int(p["PTS"])   if p["PTS"]   == p["PTS"] else 0,
+                        "reb":         int(p["REB"])   if p["REB"]   == p["REB"] else 0,
+                        "ast":         int(p["AST"])   if p["AST"]   == p["AST"] else 0,
+                        "stl":         int(p["STL"])   if p["STL"]   == p["STL"] else 0,
+                        "blk":         int(p["BLK"])   if p["BLK"]   == p["BLK"] else 0,
+                        "tov":         int(p["TO"])    if "TO" in p.index and p["TO"] == p["TO"] else 0,
+                        "fg":          f"{int(p['FGM']) if p['FGM']==p['FGM'] else 0}-{int(p['FGA']) if p['FGA']==p['FGA'] else 0}",
+                        "fg3":         f"{int(p['FG3M']) if p['FG3M']==p['FG3M'] else 0}-{int(p['FG3A']) if p['FG3A']==p['FG3A'] else 0}",
+                        "ft":          f"{int(p['FTM']) if p['FTM']==p['FTM'] else 0}-{int(p['FTA']) if p['FTA']==p['FTA'] else 0}",
+                        "plus_minus":  int(p["PLUS_MINUS"]) if "PLUS_MINUS" in p.index and p["PLUS_MINUS"] == p["PLUS_MINUS"] else 0,
+                    })
+            teams_out[team_abbr] = {
+                "players": player_rows,
+                "total_pts": sum(r["pts"] for r in player_rows),
+            }
+
+        # Summary info
+        arena = ""
+        attendance = ""
+        if summary_df is not None and not summary_df.empty:
+            s = summary_df.iloc[0]
+            arena      = str(s.get("ARENA_NAME", ""))
+            attendance = str(s.get("ATTENDANCE", ""))
+
+        # Series record if playoffs
+        series_record = ""
+        if season_type == "Playoffs" and team2_name:
+            try:
+                t1_abbr = row.get("TEAM_ABBREVIATION","")
+                wl      = row.get("WL", "")
+                # Count wins in this series from leaguegamefinder results
+                series_df = df.copy()
+                t1_wins = int((series_df["WL"] == "W").sum())
+                t1_loss = int((series_df["WL"] == "L").sum())
+                series_record = f"{t1_wins}-{t1_loss}"
+            except Exception:
+                pass
+
+        return {
+            "game_id":             game_id,
+            "date":                _parse_nba_date(row.get("GAME_DATE", "")),
+            "matchup":             matchup_str,
+            "season":              season,
+            "season_type":         season_type,
+            "arena":               arena,
+            "attendance":          attendance,
+            "home_abbr":           home_abbr,
+            "away_abbr":           away_abbr,
+            "series_record":       f"{series_away_wins}-{series_home_wins}",
+            "game_number":         game_number_in_series,
+            "series_away_wins":    series_away_wins,
+            "series_home_wins":    series_home_wins,
+            "teams":               teams_out,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ── Playoff career stats ──────────────────────────────────────────────────────
+
+def get_player_playoff_stats(player_name):
+    """
+    Career + current season playoff averages from actual game-by-game log.
+    Uses leaguegamefinder which is reliable regardless of frame index issues.
+    """
+    player_id = _get_player_id_all(player_name)
+    if not player_id:
+        return {"error": f"Player not found: {player_name}"}
+
+    try:
+        df = _nba_call(lambda: leaguegamefinder.LeagueGameFinder(
+            player_id_nullable=player_id,
+            season_type_nullable="Playoffs",
+            timeout=NBA_TIMEOUT,
+        ).get_data_frames()[0])
+
+        if df is None or df.empty:
+            return {"error": "No playoff data found"}
+
+        def _avgs(games):
+            gp = len(games)
+            if gp == 0:
+                return None
+            def avg(col):
+                try: return round(float(games[col].mean()), 1) if col in games.columns else None
+                except: return None
+            def wpct(made, att):
+                try:
+                    m = float(games[made].sum())
+                    a = float(games[att].sum())
+                    return round(m/a, 3) if a > 0 else None
+                except: return None
+            pts = avg("PTS") or 0
+            fga = float(games["FGA"].mean()) if "FGA" in games.columns else 0
+            fta = float(games["FTA"].mean()) if "FTA" in games.columns else 0
+            ts  = round(pts/(2*(fga+0.44*fta))*100, 1) if (fga+fta) > 0 else None
+            return {
+                "gp": gp, "ppg": avg("PTS"), "reb": avg("REB"),
+                "ast": avg("AST"), "stl": avg("STL"), "blk": avg("BLK"),
+                "fg_pct": wpct("FGM","FGA"), "three_pct": wpct("FG3M","FG3A"),
+                "ft_pct": wpct("FTM","FTA"), "ts_pct": ts,
+            }
+
+        # Current season = most recent SEASON_ID
+        curr_info = None
+        if "SEASON_ID" in df.columns:
+            curr_sid  = df["SEASON_ID"].iloc[0]
+            curr_df   = df[df["SEASON_ID"] == curr_sid]
+            curr      = _avgs(curr_df)
+            if curr:
+                sid_label = str(curr_sid)[1:] if len(str(curr_sid)) == 5 else str(curr_sid)
+                team = curr_df["TEAM_ABBREVIATION"].iloc[0] if "TEAM_ABBREVIATION" in curr_df.columns else ""
+                curr_info = {**curr, "season": sid_label, "team": team}
+
+        career = _avgs(df)
+
+        # Best playoff season by PPG
+        best_po = None
+        if "SEASON_ID" in df.columns:
+            best_ppg, best_sid, best_team, best_gp = 0, None, "", 0
+            for sid, grp in df.groupby("SEASON_ID"):
+                ppg = float(grp["PTS"].mean()) if "PTS" in grp.columns else 0
+                if ppg > best_ppg:
+                    best_ppg = ppg
+                    best_sid = sid
+                    best_team = grp["TEAM_ABBREVIATION"].iloc[0] if "TEAM_ABBREVIATION" in grp.columns else ""
+                    best_gp   = len(grp)
+            if best_sid:
+                sid_label = str(best_sid)[1:] if len(str(best_sid)) == 5 else str(best_sid)
+                best_po = {"season": sid_label, "team": best_team,
+                           "ppg": round(best_ppg, 1), "gp": best_gp}
+
+        if career is None:
+            return {"error": "No playoff data found"}
+
+        return {
+            "name":           player_name,
+            "career_games":   career["gp"],
+            "career_ppg":     career["ppg"],
+            "career_reb":     career["reb"],
+            "career_ast":     career["ast"],
+            "career_stl":     career["stl"],
+            "career_blk":     career["blk"],
+            "career_fg_pct":  career["fg_pct"],
+            "career_3_pct":   career["three_pct"],
+            "career_ft_pct":  career["ft_pct"],
+            "career_ts_pct":  career["ts_pct"],
+            "seasons":        df["SEASON_ID"].nunique() if "SEASON_ID" in df.columns else 1,
+            "best_season":    best_po,
+            "current_season": curr_info,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def get_player_stats_vs_team(player_name, opponent_team):
+    """
+    Career averages for a player against a specific opponent,
+    computed from box score game logs.
+    """
+    player_id = _get_player_id_all(player_name)
+    opp_abbr  = None
+    for t in nba_static_teams.get_teams():
+        if _normalize(t["full_name"]) == _normalize(opponent_team) or \
+           t["abbreviation"].upper() == opponent_team.upper():
+            opp_abbr = t["abbreviation"]
+            break
+
+    if not player_id:
+        return {"error": f"Player not found: {player_name}"}
+    if not opp_abbr:
+        return {"error": f"Team not found: {opponent_team}"}
+
+    try:
+        df = _nba_call(lambda: leaguegamefinder.LeagueGameFinder(
+            player_id_nullable=player_id,
+            timeout=NBA_TIMEOUT,
+        ).get_data_frames()[0])
+
+        if df is None or df.empty:
+            return {"error": "No game data found"}
+
+        # Filter to games against the opponent
+        opp_df = df[df["MATCHUP"].str.contains(opp_abbr, na=False)]
+        if opp_df.empty:
+            return {"error": f"No games found vs {opponent_team}"}
+
+        gp  = len(opp_df)
+        avg = lambda col: round(float(opp_df[col].mean()), 1) if col in opp_df.columns else None
+        pct = lambda col: round(float(opp_df[col].mean()), 3) if col in opp_df.columns else None
+
+        return {
+            "player":    player_name,
+            "opponent":  opponent_team,
+            "gp":        gp,
+            "ppg":       avg("PTS"),
+            "reb":       avg("REB"),
+            "ast":       avg("AST"),
+            "stl":       avg("STL"),
+            "blk":       avg("BLK"),
+            "fg_pct":    pct("FG_PCT"),
+            "three_pct": pct("FG3_PCT"),
+            "ft_pct":    pct("FT_PCT"),
+        }
+    except Exception as e:
+        return {"error": str(e)}

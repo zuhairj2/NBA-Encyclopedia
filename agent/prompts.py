@@ -1,20 +1,32 @@
 SYSTEM_PROMPT = """
-You are an elite NBA analyst — part data scientist, part former scout, part sharp sports journalist.
-You've watched every game, studied every box score, and have strong, well-reasoned opinions backed by data.
+You are an elite NBA analyst with the depth of someone who has watched every game for 30 years,
+studied advanced metrics rigorously, and understands the game tactically at a coaching level.
+You combine the statistical rigor of a data scientist with the narrative instinct of a great journalist.
 
-CRITICAL: You form your own opinion from the data. You do NOT simply agree with the user's premise.
-If someone asks "does X have a solid argument over Y?" — evaluate the actual numbers and give your
-honest take, even if it means disagreeing with them. A good analyst pushes back when the data
-doesn't support the framing. Do not be a yes-man.
+CRITICAL RULES:
+1. Do NOT agree with the user just because they asked a question a certain way. Form your own view from the data.
+2. Only discuss players/teams the user named. Never bring in unrelated players to pad your answer.
+3. When stats are provided, use the actual numbers — don't make up statistics.
+4. Be willing to push back directly if the premise is flawed.
 
-Your analysis style:
-- Lead with your own conclusion, not the user's framing
-- Give concrete, specific takes — reference actual stats provided
-- Use basketball terminology naturally (net rating, paint touches, transition defense, creation rate)
-- Be willing to say "actually, the data doesn't support that"
-- When asked for predictions or opinions, commit to a position and defend it with data
-- Keep responses focused and punchy — 3-5 paragraphs max
-- Never just validate whoever the user mentions first
+ANALYSIS DEPTH — you can tackle:
+- Advanced metric interpretation: ORTG, DRTG, NET RTG, TS%, USG%, DBPM, BPM, VORP context
+- Lineup/role analysis: starter vs bench impact, two-way players, positional versatility
+- Tactical breakdowns: pick-and-roll efficiency, transition offense, halfcourt creation, paint touches
+- Historical context: how current players compare to historical greats at the same age/stage
+- Playoff vs regular season performance differences and what they mean
+- Contract value, team building implications, trade scenarios
+- Injury context and how it affects projections
+- Draft analysis: prospect evaluation, fit with teams
+- Coaching schemes: pace, defensive schemes, offensive systems
+- Clutch performance, fourth-quarter splits, high-leverage situations
+
+STYLE:
+- Lead with your sharpest insight, not a recap of what's already obvious
+- Use specific numbers from the data provided
+- Make concrete comparisons (historical or contemporary)
+- Have a clear opinion — analysts take stances
+- 3-5 paragraphs, punchy and direct
 
 Current season: 2025-26 NBA season.
 """
@@ -30,37 +42,51 @@ def build_player_stats_prompt(stats):
         if acols.get("all_star"):    parts.append(f"{acols['all_star']}x All-Star")
         if acols.get("all_nba"):     parts.append(f"{acols['all_nba']}x All-NBA")
         if acols.get("scoring"):     parts.append(f"{acols['scoring']}x Scoring Title")
+        if acols.get("dpoy"):        parts.append(f"{acols['dpoy']}x DPOY")
         acol_str = "Career accolades: " + ", ".join(parts) if parts else ""
 
+    net = stats.get("net_rtg", "—")
+    net_sign = "positive" if isinstance(net, (int, float)) and net > 0 else "negative"
+
     return f"""
-Analyze {stats['name']}'s 2025-26 season:
+Analyze {stats['name']}'s 2025-26 season with depth:
 
 Team: {stats['team']} | Games: {stats['gp']}
 {acol_str}
 
 Scoring & Creation:
   PPG {stats['ppg']} (League #{stats.get('rank_pts','—')}) | FG% {round(stats['fg_pct']*100,1)}% | TS% {stats.get('ts_pct','—')}%
-  3PT% {round(stats['three_pct']*100,1)}% on {stats.get('fg3a_pg','—')} attempts | FT% {round(stats['ft_pct']*100,1)}% | USG% {stats.get('usg_pct','—')}%
+  3PT% {round(stats['three_pct']*100,1)}% on {stats.get('fg3a_pg','—')} attempts/game | FT% {round(stats['ft_pct']*100,1)}%
+  FTA/game {stats.get('fta_pg','—')} | USG% {stats.get('usg_pct','—')}% | MIN {stats.get('min_pg','—')}
 
 All-around:
   REB {stats['reb']} (#{stats.get('rank_reb','—')}) | AST {stats['ast']} (#{stats.get('rank_ast','—')})
   STL {stats['stl']} (#{stats.get('rank_stl','—')}) | BLK {stats['blk']} (#{stats.get('rank_blk','—')})
-  TOV {stats.get('tov','—')} | MIN {stats.get('min_pg','—')}
+  TOV {stats.get('tov','—')}
 
-On/Off ratings:
-  ORTG {stats.get('ortg','—')} (#{stats.get('rank_ortg','—')}) | DRTG {stats.get('drtg','—')} (#{stats.get('rank_drtg','—')}) | NET {stats.get('net_rtg','—')}
+On/Off impact:
+  ORTG {stats.get('ortg','—')} (#{stats.get('rank_ortg','—')}) | DRTG {stats.get('drtg','—')} (#{stats.get('rank_drtg','—')})
+  NET RTG {net} ({net_sign} impact when on court)
 
-Write a sharp, opinionated breakdown of this player's season. Cover:
-1. What these numbers say about his role and impact — is he living up to expectations?
-2. The single most impressive AND most concerning stat line
-3. How he fits into the MVP/award race or playoff picture based on these numbers
-4. One specific thing he needs to improve to elevate his game
+Give a sharp, layered analysis covering:
+1. What his efficiency profile (TS%, FG%, FTA rate) tells us about HOW he scores — volume scorer, creator, or efficient finisher?
+2. His two-way impact — does the NET RTG/DRTG suggest he's helping or hurting the team defensively?
+3. The most interesting statistical story from this line — something non-obvious
+4. Where he ranks in the current MVP/award/playoff conversation based purely on these numbers
+5. One concrete thing that would elevate his game
 
-Be direct. Use basketball context. Take a position.
+Use basketball terminology. Reference the league ranks to give context. Take a clear stance.
 """
 
 
 def build_team_season_prompt(stats):
+    scorer    = stats.get('best_scorer') or {}
+    rebounder = stats.get('best_rebounder') or {}
+    top_str   = (
+        f"{scorer.get('name','—')} ({scorer.get('stat_val','—')} PPG), "
+        f"{rebounder.get('name','—')} ({rebounder.get('stat_val','—')} RPG)"
+    )
+
     return f"""
 Analyze the {stats['team']}'s 2025-26 season:
 
@@ -72,13 +98,13 @@ Offense (Rank #{stats.get('rank_pts','—')} in scoring):
   FTA {stats.get('fta_pg','—')} (#{stats.get('rank_fta','—')})
 
 Defense & Pace:
-  Opp PPG allowed: context from DRTG | REB {stats['reb']} (#{stats.get('rank_reb','—')})
+  REB {stats['reb']} (#{stats.get('rank_reb','—')})
   STL {stats['stl']} (#{stats.get('rank_stl','—')}) | BLK {stats['blk']} (#{stats.get('rank_blk','—')})
 
 Advanced:
   ORTG {stats.get('ortg','—')} (#{stats.get('rank_ortg','—')}) | DRTG {stats.get('drtg','—')} (#{stats.get('rank_drtg','—')}) | NET RTG {stats.get('net_rtg','—')}
 
-Top performers: {stats.get('best_scorer',{}).get('name','—')} ({stats.get('best_scorer',{}).get('stat_val','—')} PPG), {stats.get('best_rebounder',{}).get('name','—')} ({stats.get('best_rebounder',{}).get('stat_val','—')} RPG)
+Top performers: {top_str}
 
 Give a real analysis of this team — what's working, what's broken, and what their playoff ceiling looks like.
 Cover: identity (what kind of team are they?), biggest strength, most glaring weakness, and a realistic playoff projection.
