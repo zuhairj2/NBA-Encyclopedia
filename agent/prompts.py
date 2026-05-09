@@ -245,36 +245,5 @@ Commit to a position. Restrict your analysis to the players/teams the user named
 """
 
 
-def build_game_prompt(stats):
-    """Legacy single-game analysis prompt."""
-    players = "\n".join([
-        f"  {p['name']}: {p['points']} pts | {p['assists']} ast | {p['rebounds']} reb | "
-        f"FG% {p['fg_pct']} | 3PT% {p['three_pct']}"
-        for p in stats.get("players", [])
-    ])
-
-    return f"""
-Game result — {stats['team']}:
-  Result: {stats['result']} | Score: {stats['points']} pts
-  FG% {stats['fg_pct']} | 3PT% {stats['three_pct']} | TOV {stats['turnovers']} | REB {stats['rebounds']}
-
-Key players:
-{players}
-
-What was the decisive factor in this game? Who stood out, who let the team down,
-and what does this result say about where this team is heading? Be specific and direct.
-"""
-
-
-def build_season_prompt(stats):
-    """Legacy season prompt."""
-    return build_team_season_prompt(stats)
-
-
-def build_comparison_prompt(stats):
-    """Legacy team comparison prompt."""
-    return build_team_comparison_prompt(stats)
-
-
 def build_series_prompt(stats):
     return build_team_comparison_prompt(stats)

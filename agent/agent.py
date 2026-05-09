@@ -3,7 +3,9 @@ from dotenv import load_dotenv
 from groq import Groq
 
 load_dotenv()
-client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+
+_groq_key = os.getenv("GROQ_API_KEY", "")
+client = Groq(api_key=_groq_key) if _groq_key else None
 
 # ── Web search ────────────────────────────────────────────────────────────────
 _tavily_client = None
@@ -56,9 +58,6 @@ def _web_search(query, max_results=4):
         return "", []
 
 from agent.tools import (
-    get_last_game_with_players,
-    get_team_season_stats,
-    get_last_n_games,
     compare_teams,
     compare_players,
     get_top_league_leaders,
@@ -70,10 +69,7 @@ from agent.tools import (
 
 from agent.prompts import (
     SYSTEM_PROMPT,
-    build_game_prompt,
-    build_season_prompt,
     build_trend_prompt,
-    build_comparison_prompt,
     build_series_prompt,
     build_player_comparison_prompt,
     build_league_leaders_prompt,
@@ -128,15 +124,21 @@ NEWS_KEYWORDS = [
 ]
 
 
-def _call_llm(prompt, temperature=0.7, max_tokens=1024):
-    """Call the Groq LLM with the given prompt."""
+def _call_llm(prompt, temperature=0.7, max_tokens=1024, history=None):
+    """Call the Groq LLM. history = list of {role, content} dicts for multi-turn."""
+    if client is None:
+        return "Analysis unavailable — GROQ_API_KEY not configured."
     try:
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        # Inject conversation history (last 6 turns max to stay within context)
+        if history:
+            for turn in history[-6:]:
+                messages.append({"role": turn["role"], "content": turn["content"]})
+        messages.append({"role": "user", "content": prompt})
+
         response = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user",   "content": prompt},
-            ],
+            messages=messages,
             temperature=temperature,
             max_tokens=max_tokens,
         )
@@ -172,10 +174,10 @@ def _get_scoring_leaders_context():
         return ""
 
 
-def run_agent(user_input):
+def run_agent(user_input, history=None):
     """
     Returns (analysis_text, sources_list).
-    sources_list = [{"title": ..., "url": ..., "domain": ...}, ...]
+    history = list of {role, content} dicts for multi-turn conversation.
     """
     lower = user_input.lower()
     all_sources = []
@@ -212,7 +214,7 @@ Be specific, cite what you found, and add brief analytical context where relevan
 If the web results don't directly answer the question, say so and use your knowledge.
 Keep it concise and factual — 2-4 paragraphs max.
 """
-        return _call_llm(prompt, temperature=0.5, max_tokens=900), all_sources
+        return _call_llm(prompt, temperature=0.5, max_tokens=900, history=history), all_sources
 
     # ── 1. Opinion / prediction queries ───────────────────────────────────────
     if any(kw in lower for kw in OPINION_KEYWORDS):
@@ -289,7 +291,7 @@ Keep it concise and factual — 2-4 paragraphs max.
             context += f"\n\nCurrent web context:\n{web_results}"
 
         prompt = build_opinion_prompt(user_input, context)
-        return _call_llm(prompt, temperature=0.72, max_tokens=1200), all_sources
+        return _call_llm(prompt, temperature=0.72, max_tokens=1200, history=history), all_sources
 
     # ── 2. League-wide leaders ────────────────────────────────────────────────
     if is_league_wide_query(user_input):
@@ -304,7 +306,7 @@ Keep it concise and factual — 2-4 paragraphs max.
             "FG3_PCT": "3-Point %",
         }
         prompt = build_league_leaders_prompt(leaders, stat_labels.get(stat, stat))
-        return _call_llm(prompt, temperature=0.7, max_tokens=900), []
+        return _call_llm(prompt, temperature=0.7, max_tokens=900, history=history), []
 
     # ── 3. Player comparison ──────────────────────────────────────────────────
     if ("vs" in lower or "compare" in lower) and not extract_teams(user_input):
@@ -313,7 +315,7 @@ Keep it concise and factual — 2-4 paragraphs max.
             stats = compare_players(players[0], players[1])
             if "error" not in stats:
                 prompt = build_player_comparison_prompt(stats)
-                return _call_llm(prompt, temperature=0.75, max_tokens=1000), []
+                return _call_llm(prompt, temperature=0.75, max_tokens=1000, history=history), []
 
     # ── 4. Team vs team (series / matchup) ───────────────────────────────────
     teams = extract_teams(user_input)
@@ -322,12 +324,12 @@ Keep it concise and factual — 2-4 paragraphs max.
             stats = compare_teams(teams[0], teams[1])
             if "error" not in stats:
                 prompt = build_series_prompt(stats)
-                return _call_llm(prompt, temperature=0.75, max_tokens=1000), []
+                return _call_llm(prompt, temperature=0.75, max_tokens=1000, history=history), []
         else:
             stats = compare_teams(teams[0], teams[1])
             if "error" not in stats:
                 prompt = build_team_comparison_prompt(stats)
-                return _call_llm(prompt, temperature=0.7, max_tokens=1000), []
+                return _call_llm(prompt, temperature=0.7, max_tokens=1000, history=history), []
 
     # ── 5. Single player stats ────────────────────────────────────────────────
     player = extract_single_player(user_input)
@@ -335,7 +337,7 @@ Keep it concise and factual — 2-4 paragraphs max.
         stats = get_player_season_stats(player)
         if "error" not in stats:
             prompt = build_player_stats_prompt(stats)
-            return _call_llm(prompt, temperature=0.7, max_tokens=900), []
+            return _call_llm(prompt, temperature=0.7, max_tokens=900, history=history), []
 
     # ── 6. Team game log / trend ──────────────────────────────────────────────
     if teams and any(kw in lower for kw in TREND_KEYWORDS):
@@ -348,7 +350,7 @@ Keep it concise and factual — 2-4 paragraphs max.
         log = get_team_game_log(team, n)
         if isinstance(log, list) and log:
             prompt = build_trend_prompt(team, log)
-            return _call_llm(prompt, temperature=0.7, max_tokens=900), []
+            return _call_llm(prompt, temperature=0.7, max_tokens=900, history=history), []
 
     # ── 7. Single team season stats ───────────────────────────────────────────
     if teams:
@@ -356,7 +358,7 @@ Keep it concise and factual — 2-4 paragraphs max.
         stats = get_team_full_stats(team)
         if "error" not in stats:
             prompt = build_team_season_prompt(stats)
-            return _call_llm(prompt, temperature=0.7, max_tokens=900), []
+            return _call_llm(prompt, temperature=0.7, max_tokens=900, history=history), []
 
     # ── 8. Generic fallback ───────────────────────────────────────────────────
     web_ctx, sources = _web_search(f"NBA 2025 {user_input}", max_results=3)
@@ -365,4 +367,4 @@ Keep it concise and factual — 2-4 paragraphs max.
     if web_ctx:
         context += f"\n\nWeb search results:\n{web_ctx}"
     prompt = build_opinion_prompt(user_input, context)
-    return _call_llm(prompt, temperature=0.8, max_tokens=1000), all_sources
+    return _call_llm(prompt, temperature=0.8, max_tokens=1000, history=history), all_sources
